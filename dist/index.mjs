@@ -636,9 +636,6 @@ var STATIC_CATALOG = [
   }
 ];
 
-// src/adapters/capy/app-client.ts
-import os from "os";
-
 // src/domain/errors.ts
 var STATUS = {
   invalid_request: 400,
@@ -680,6 +677,33 @@ function isCapyError(value) {
 }
 function isAuthError(value) {
   return isCapyError(value) && value.kind === "sign_in_required";
+}
+function isAbort(error) {
+  return Boolean(error && typeof error === "object" && error.name === "AbortError");
+}
+function errorText(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function mapCapyCode(code, message) {
+  if (code === "region_unsupported") {
+    return new CapyError("region_unsupported", message, { detail: code });
+  }
+  if (code === "unauthorized") {
+    return new CapyError("sign_in_required", message, { detail: code });
+  }
+  if (code === "forbidden") {
+    return new CapyError("upstream_error", message, { status: 403, detail: code });
+  }
+  if (code === "rate_limited") {
+    return new CapyError("rate_limited", message, { detail: code });
+  }
+  if (/quota|credit/iu.test(code)) {
+    return new CapyError("insufficient_quota", message, { detail: code });
+  }
+  if (/ModelSelection/iu.test(code)) {
+    return new CapyError("model_not_found", message, { detail: code });
+  }
+  return new CapyError("upstream_error", message, { detail: code });
 }
 function mapUpstream(status, body, fallback = "") {
   const tag = tagOf(body);
@@ -766,7 +790,9 @@ async function requestJson(fetchImpl, url, init = {}, timeoutMs = 30000) {
     try {
       response = await fetchImpl(url, { ...init, signal: controller.signal });
     } catch (error) {
-      if (controller.signal.aborted && !signal?.aborted) {
+      if (signal?.aborted)
+        throw error;
+      if (controller.signal.aborted) {
         throw new CapyError("upstream_timeout", "\u8FDE\u63A5 Capy \u8D85\u65F6\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC/\u4EE3\u7406\u540E\u91CD\u8BD5", { cause: error });
       }
       throw new CapyError("upstream_unavailable", `\u8FDE\u63A5 Capy \u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`, { cause: error });
@@ -784,6 +810,34 @@ async function requestJson(fetchImpl, url, init = {}, timeoutMs = 30000) {
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
+  }
+}
+async function requestCapyJson(fetchImpl, url, init = {}, timeoutMs = 30000) {
+  const { response, body, text } = await requestJson(fetchImpl, url, init, timeoutMs);
+  if (!response.ok)
+    throw mapUpstream(response.status, body, text.slice(0, 300));
+  return body;
+}
+async function readJsonBody(input, init) {
+  if (typeof init.body === "string")
+    return JSON.parse(init.body);
+  if (init.body)
+    return JSON.parse(await new Response(init.body).text());
+  if (input instanceof Request)
+    return JSON.parse(await input.text());
+  return {};
+}
+
+// src/adapters/platform/jwt.ts
+function decodeJwtPayload(token) {
+  const part = token.split(".")[1];
+  if (!part)
+    return null;
+  try {
+    const value = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
   }
 }
 
@@ -808,11 +862,8 @@ function appHeaders(jwt, extra = {}) {
     ...extra
   };
 }
-function clientHeaders(jwt, clientId, extra = {}) {
-  return appHeaders(jwt, {
-    ...clientId ? { "x-capy-client-id": clientId } : {},
-    ...extra
-  });
+function clientHeaders(jwt, extra = {}) {
+  return appHeaders(jwt, extra);
 }
 function publicHeaders(apiKey, extra = {}) {
   return { authorization: `Bearer ${apiKey}`, accept: "application/json", ...extra };
@@ -862,28 +913,15 @@ class ClerkClient {
     return jwt;
   }
 }
-function decodeJwtPayload(token) {
-  const part = token.split(".")[1];
-  if (!part)
-    return null;
-  try {
-    const value = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
-    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
-  } catch {
-    return null;
-  }
-}
 
 // src/adapters/capy/app-client.ts
-function deviceOs() {
-  if (process.platform === "win32")
-    return "win32";
-  if (process.platform === "darwin")
-    return "darwin";
-  return "linux";
-}
-function deviceArch() {
-  return process.arch === "arm64" ? "arm64" : "x86_64";
+function itemsOf(body) {
+  if (Array.isArray(body))
+    return body;
+  if (body && typeof body === "object" && Array.isArray(body.items)) {
+    return body.items;
+  }
+  return [];
 }
 
 class CapyAppClient {
@@ -910,8 +948,7 @@ class CapyAppClient {
   }
   async organizations(jwt, signal) {
     const body = await this.json(jwt, "/organizations", { method: "GET", ...signal ? { signal } : {} });
-    const list = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray(body.items) ? body.items : [];
-    return list.flatMap((item) => {
+    return itemsOf(body).flatMap((item) => {
       if (!item || typeof item !== "object")
         return [];
       const record = item;
@@ -943,8 +980,7 @@ class CapyAppClient {
       method: "GET",
       ...signal ? { signal } : {}
     });
-    const list = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray(body.items) ? body.items : [];
-    return list.flatMap((item) => {
+    return itemsOf(body).flatMap((item) => {
       if (!item || typeof item !== "object")
         return [];
       const record = item;
@@ -965,9 +1001,9 @@ class CapyAppClient {
     const body = await this.json(jwt, "/devices/code", {
       method: "POST",
       body: JSON.stringify({
-        hostname: input.hostname || os.hostname(),
-        os: input.os || deviceOs(),
-        arch: input.arch || deviceArch()
+        hostname: input.hostname,
+        os: input.os,
+        arch: input.arch
       }),
       ...signal ? { signal } : {}
     });
@@ -1057,12 +1093,7 @@ class CapyAppClient {
     const kind = machine && typeof machine === "object" && !Array.isArray(machine) ? String(machine.kind ?? "") : "";
     return {
       id,
-      primaryMachine: {
-        kind: kind === "cloud" ? "cloud" : "device",
-        ...machine && typeof machine === "object" && !Array.isArray(machine) && typeof machine.name === "string" ? { name: String(machine.name) } : {}
-      },
-      ...record.ask === null || record.ask && typeof record.ask === "object" ? { ask: record.ask } : {},
-      ...record.modelDefault && typeof record.modelDefault === "object" ? { modelDefault: record.modelDefault } : {}
+      primaryMachine: { kind: kind === "cloud" ? "cloud" : "device" }
     };
   }
   async getJam(jwt, orgId, jamId, signal) {
@@ -1093,11 +1124,9 @@ class CapyAppClient {
       return [{
         id,
         kind,
-        ...typeof value.state === "string" ? { state: value.state } : {},
         payload: {
           ...typeof payload.code === "string" ? { code: payload.code } : {},
-          ...typeof payload.message === "string" ? { message: payload.message } : {},
-          ...typeof payload.retryable === "boolean" ? { retryable: payload.retryable } : {}
+          ...typeof payload.message === "string" ? { message: payload.message } : {}
         }
       }];
     });
@@ -1110,13 +1139,7 @@ class CapyAppClient {
     });
   }
   async json(jwt, route, init, extraHeaders = {}) {
-    const { response, body, text } = await requestJson(this.fetchImpl, `${CAPY_APP}${route}`, {
-      ...init,
-      headers: clientHeaders(jwt, "", extraHeaders)
-    }, 30000);
-    if (!response.ok)
-      throw mapUpstream(response.status, body, text.slice(0, 300));
-    return body;
+    return await requestCapyJson(this.fetchImpl, `${CAPY_APP}${route}`, { ...init, headers: clientHeaders(jwt, extraHeaders) }, 30000);
   }
 }
 
@@ -1124,12 +1147,12 @@ class CapyAppClient {
 import { spawn } from "child_process";
 import { createServer } from "net";
 import fs2 from "fs";
-import os3 from "os";
+import os2 from "os";
 import path2 from "path";
 
 // src/adapters/capy/local-login.ts
 import fs from "fs";
-import os2 from "os";
+import os from "os";
 import path from "path";
 
 // src/adapters/platform/dpapi.ts
@@ -1143,27 +1166,21 @@ var DPAPI_TIMEOUT_MS = 15000;
 function powershell(script) {
   return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], { encoding: "utf8", timeout: DPAPI_TIMEOUT_MS, windowsHide: true, maxBuffer: 1024 * 1024 }).trim();
 }
-function dpapiUnprotect(blob) {
+function dpapiTransform(encoded, op) {
   if (process.platform !== "win32")
     throw new Error("DPAPI \u53EA\u5728 Windows \u53EF\u7528");
-  const encoded = Buffer.from(blob).toString("base64");
   const script = `$ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Security
 $b=[Convert]::FromBase64String('${encoded}')
-$p=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-[Convert]::ToBase64String($p)`;
-  return Buffer.from(powershell(script), "base64");
-}
-function dpapiProtect(text) {
-  if (process.platform !== "win32")
-    throw new Error("DPAPI \u53EA\u5728 Windows \u53EF\u7528");
-  const encoded = Buffer.from(text, "utf8").toString("base64");
-  const script = `$ErrorActionPreference='Stop'
-Add-Type -AssemblyName System.Security
-$b=[Convert]::FromBase64String('${encoded}')
-$p=[System.Security.Cryptography.ProtectedData]::Protect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+$p=[System.Security.Cryptography.ProtectedData]::${op}($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
 [Convert]::ToBase64String($p)`;
   return powershell(script);
+}
+function dpapiUnprotect(blob) {
+  return Buffer.from(dpapiTransform(Buffer.from(blob).toString("base64"), "Unprotect"), "base64");
+}
+function dpapiProtect(text) {
+  return dpapiTransform(Buffer.from(text, "utf8").toString("base64"), "Protect");
 }
 function decryptChromiumAesGcm(ciphertextBase64, key) {
   const raw = Buffer.from(ciphertextBase64, "base64");
@@ -1182,9 +1199,7 @@ function decryptChromiumAesGcm(ciphertextBase64, key) {
 }
 function coerceAesKey(value) {
   let key = null;
-  if (Buffer.isBuffer(value))
-    key = value;
-  else if (ArrayBuffer.isView(value))
+  if (ArrayBuffer.isView(value))
     key = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
   else if (value instanceof ArrayBuffer)
     key = Buffer.from(value);
@@ -1200,7 +1215,7 @@ function coerceAesKey(value) {
 var DPAPI_PREFIX = "DPAPI";
 function capyDir() {
   const appData = String(process.env.APPDATA ?? "").trim();
-  return path.join(appData || path.join(os2.homedir(), "AppData", "Roaming"), "Capy");
+  return path.join(appData || path.join(os.homedir(), "AppData", "Roaming"), "Capy");
 }
 function readJson(file, label) {
   let text;
@@ -1222,17 +1237,10 @@ function stringOf(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 function jwtPayload(token) {
-  const part = token.split(".")[1];
-  if (!part)
-    throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u51ED\u636E\u4E0D\u662F\u6709\u6548 JWT");
-  try {
-    const value = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value))
-      throw new Error("not object");
-    return value;
-  } catch {
+  const value = decodeJwtPayload(token);
+  if (!value)
     throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u51ED\u636E\u7684 JWT payload \u65E0\u6CD5\u89E3\u6790");
-  }
+  return value;
 }
 function readCapyInstall(dir = capyDir()) {
   if (process.platform !== "win32") {
@@ -1343,18 +1351,26 @@ class CdpConnection {
     this.ws = ws;
     ws.addEventListener("message", (event) => this.onMessage(event));
     ws.addEventListener("close", () => {
-      for (const item of this.pending.values())
+      for (const item of this.pending.values()) {
+        clearTimeout(item.timer);
         item.reject(new Error("CDP \u8FDE\u63A5\u5DF2\u5173\u95ED"));
+      }
       this.pending.clear();
     });
   }
-  send(method, params = {}) {
+  send(method, params = {}, timeoutMs = 1e4) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP ${method} \u8D85\u65F6`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, timer });
       try {
         this.ws.send(JSON.stringify({ id, method, params }));
       } catch (error) {
+        clearTimeout(timer);
         this.pending.delete(id);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
@@ -1377,6 +1393,7 @@ class CdpConnection {
     const item = this.pending.get(message.id);
     if (!item)
       return;
+    clearTimeout(item.timer);
     this.pending.delete(message.id);
     if (message.error)
       item.reject(new Error(message.error.message || "CDP error"));
@@ -1384,8 +1401,11 @@ class CdpConnection {
       item.resolve(message.result);
   }
 }
-async function cdpJson(port, route) {
-  const response = await fetch(`http://127.0.0.1:${port}${route}`);
+async function cdpJson(port, route, signal) {
+  const timeout = AbortSignal.timeout(2000);
+  const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+  });
   if (!response.ok)
     return null;
   try {
@@ -1429,7 +1449,15 @@ async function connectPage(port, signal, timeoutMs) {
 }
 function waitOpen(ws, signal) {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try {
+        ws.close();
+      } catch {}
+      reject(new Error("\u6D4F\u89C8\u5668 CDP WebSocket \u8FDE\u63A5\u8D85\u65F6"));
+    }, 1e4);
+    timer.unref?.();
     const onAbort = () => {
+      clearTimeout(timer);
       try {
         ws.close();
       } catch {}
@@ -1439,11 +1467,16 @@ function waitOpen(ws, signal) {
       return onAbort();
     signal.addEventListener("abort", onAbort, { once: true });
     ws.addEventListener("open", () => {
+      clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
       resolve();
     }, { once: true });
     ws.addEventListener("error", () => {
+      clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
+      try {
+        ws.close();
+      } catch {}
       reject(new CapyError("upstream_unavailable", "\u6D4F\u89C8\u5668 CDP WebSocket \u8FDE\u63A5\u5931\u8D25"));
     }, { once: true });
   });
@@ -1495,18 +1528,8 @@ async function readCookie(cdp) {
   return "";
 }
 function clientIdOf(clientJwt) {
-  const part = clientJwt.split(".")[1];
-  if (!part)
-    return "";
-  try {
-    const value = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value))
-      return "";
-    const id = value.id;
-    return typeof id === "string" ? id : "";
-  } catch {
-    return "";
-  }
+  const payload = decodeJwtPayload(clientJwt);
+  return typeof payload?.id === "string" ? payload.id : "";
 }
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -1555,7 +1578,7 @@ async function chromiumLogin(options = {}) {
   }
   const signal = options.signal ?? new AbortController().signal;
   const timeoutMs = Math.max(1e4, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  const profile = fs2.mkdtempSync(path2.join(os3.tmpdir(), "magpie-capy-"));
+  const profile = fs2.mkdtempSync(path2.join(os2.tmpdir(), "magpie-capy-"));
   let child = null;
   try {
     let port = 0;
@@ -1583,61 +1606,74 @@ async function chromiumLogin(options = {}) {
       throw new CapyError("upstream_unavailable", "\u6D4F\u89C8\u5668\u6CA1\u6709\u6253\u5F00\u8C03\u8BD5\u7AEF\u53E3");
     const deadline = Date.now() + timeoutMs;
     let sawClerk = false;
-    let sawCookieProblem = false;
-    while (Date.now() < deadline) {
-      throwIfAborted(signal);
-      if (child && browserExited(child)) {
-        throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u6D4F\u89C8\u5668\u5DF2\u5173\u95ED\uFF0C\u8BF7\u91CD\u65B0\u53D1\u8D77\u767B\u5F55");
-      }
-      let cdp = null;
-      try {
-        cdp = await connectPage(port, signal, 5000);
-        const stateRaw = await evaluate(cdp, CLERK_STATE);
-        if (stateRaw) {
-          sawClerk = true;
-          let state = null;
-          try {
-            state = JSON.parse(stateRaw);
-          } catch {}
-          const clientJwt = await readCookie(cdp);
-          if (!clientJwt) {
-            sawCookieProblem = true;
-          } else if (state?.sessionId && state.userId) {
-            const orgId = await evaluate(cdp, SELECTED_ORG).catch(() => "");
-            const credential = {
-              clientJwt,
-              sessionId: state.sessionId,
-              userId: state.userId,
-              clientId: clientIdOf(clientJwt),
-              ...orgId ? { orgId: String(orgId) } : {},
-              source: "browser"
-            };
-            return credential;
-          }
+    let cdp = null;
+    try {
+      while (Date.now() < deadline) {
+        throwIfAborted(signal);
+        if (child && browserExited(child)) {
+          throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u6D4F\u89C8\u5668\u5DF2\u5173\u95ED\uFF0C\u8BF7\u91CD\u65B0\u53D1\u8D77\u767B\u5F55");
         }
-      } catch (error) {
-        if (signal.aborted)
-          throw abortError();
-        if (error instanceof CapyError && error.kind === "sign_in_required")
-          throw error;
-      } finally {
-        cdp?.close();
+        try {
+          cdp ??= await connectPage(port, signal, 5000);
+          const stateRaw = await evaluate(cdp, CLERK_STATE);
+          if (stateRaw) {
+            sawClerk = true;
+            let state = null;
+            try {
+              state = JSON.parse(stateRaw);
+            } catch {}
+            const clientJwt = await readCookie(cdp);
+            if (clientJwt && state?.sessionId && state.userId) {
+              const orgId = await evaluate(cdp, SELECTED_ORG).catch(() => "");
+              return {
+                clientJwt,
+                sessionId: state.sessionId,
+                userId: state.userId,
+                clientId: clientIdOf(clientJwt),
+                ...orgId ? { orgId: String(orgId) } : {},
+                source: "browser"
+              };
+            }
+          }
+        } catch (error) {
+          cdp?.close();
+          cdp = null;
+          if (signal.aborted)
+            throw abortError();
+          if (error instanceof CapyError && error.kind === "sign_in_required")
+            throw error;
+        }
+        await sleep(POLL_MS, signal);
       }
-      await sleep(POLL_MS, signal);
+    } finally {
+      cdp?.close();
     }
-    if (sawClerk || sawCookieProblem) {
+    if (sawClerk) {
       throw new CapyError("sign_in_required", "\u5DF2\u5728 Capy \u767B\u5F55\uFF0C\u4F46\u8BFB\u4E0D\u5230 __client Cookie\u3002\u8BF7\u8BA9\u6D4F\u89C8\u5668\u505C\u7559\u5728 capy.ai \u9875\u9762\u540E\u91CD\u8BD5");
     }
     throw new CapyError("upstream_timeout", "\u7B49\u5F85 Capy \u6D4F\u89C8\u5668\u767B\u5F55\u8D85\u65F6\uFF0C\u8BF7\u91CD\u8BD5");
   } finally {
-    try {
-      child?.kill("SIGTERM");
-    } catch {}
+    if (child)
+      killTree(child);
     setTimeout(() => {
       try {
         fs2.rmSync(profile, { recursive: true, force: true });
       } catch {}
     }, 1000).unref?.();
+  }
+}
+function killTree(child) {
+  try {
+    child.kill("SIGTERM");
+  } catch {}
+  if (process.platform === "win32" && child.pid) {
+    try {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore"
+      });
+      killer.unref();
+    } catch {}
   }
 }
 
@@ -1675,11 +1711,13 @@ function sleep(ms, signal) {
 // src/adapters/capy/device-tunnel.ts
 import { spawn as spawn2 } from "child_process";
 import { createHash } from "crypto";
+import { StringDecoder } from "string_decoder";
 import fs3 from "fs";
-import os4 from "os";
+import os3 from "os";
 import path3 from "path";
 
 // src/domain/account.ts
+var SESSION_TTL_MS = 7 * 24 * 3600000;
 function accountKey(session) {
   return `${session.uid || session.accountId}@${session.orgId}`;
 }
@@ -1689,14 +1727,14 @@ var HEADLESS_NAME = "magpie-headless";
 var READY_TIMEOUT_MS = 15000;
 var CONNECT_POLL_MS = 400;
 var STATE_VERSION = 1;
-function deviceOs2() {
+function deviceOs() {
   if (process.platform === "win32")
     return "win32";
   if (process.platform === "darwin")
     return "darwin";
   return "linux";
 }
-function deviceArch2() {
+function deviceArch() {
   return process.arch === "arm64" ? "arm64" : "x86_64";
 }
 function defaultDeviceName() {
@@ -1705,11 +1743,11 @@ function defaultDeviceName() {
     return override.slice(0, 80);
   let host = "";
   try {
-    host = os4.hostname();
+    host = os3.hostname();
   } catch {}
   let user = "";
   try {
-    user = os4.userInfo().username;
+    user = os3.userInfo().username;
   } catch {}
   if (!user)
     user = String(process.env.USERNAME ?? process.env.USER ?? "").trim();
@@ -1721,12 +1759,12 @@ function stateDir() {
   if (override)
     return path3.resolve(override);
   if (process.platform === "win32") {
-    return path3.join(process.env.LOCALAPPDATA || path3.join(os4.homedir(), "AppData", "Local"), "magpie-capy");
+    return path3.join(process.env.LOCALAPPDATA || path3.join(os3.homedir(), "AppData", "Local"), "magpie-capy");
   }
   if (process.platform === "darwin") {
-    return path3.join(os4.homedir(), "Library", "Application Support", "magpie-capy");
+    return path3.join(os3.homedir(), "Library", "Application Support", "magpie-capy");
   }
-  return path3.join(process.env.XDG_STATE_HOME || path3.join(os4.homedir(), ".local", "state"), "magpie-capy");
+  return path3.join(process.env.XDG_STATE_HOME || path3.join(os3.homedir(), ".local", "state"), "magpie-capy");
 }
 
 class FileSecretStore {
@@ -1779,14 +1817,7 @@ class FileSecretStore {
     return path3.join(this.baseDir, `headless-${safe}.json`);
   }
 }
-function headerValue(headers, name) {
-  const wanted = name.toLowerCase();
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === wanted)
-      return String(value);
-  }
-  return "";
-}
+var STREAM_TIMEOUT_MS = 60000;
 function encodeDataFrame(streamId, body) {
   const frame = Buffer.alloc(4 + body.length);
   frame.writeUInt32BE(streamId >>> 0, 0);
@@ -1861,10 +1892,12 @@ async function runBash(params, cwd) {
       resolve(fail("MachineServer.Bash", `Failed to start bash: ${error instanceof Error ? error.message : String(error)}`));
       return;
     }
-    const append = (current, chunk) => {
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const append = (current, text) => {
       if (current.length >= maxChars)
         return current;
-      return current + chunk.toString("utf8").slice(0, maxChars - current.length);
+      return current + text.slice(0, maxChars - current.length);
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -1879,10 +1912,10 @@ async function runBash(params, cwd) {
     }, timeoutSeconds * 1000);
     timer.unref?.();
     child.stdout?.on("data", (chunk) => {
-      stdout = append(stdout, chunk);
+      stdout = append(stdout, stdoutDecoder.write(chunk));
     });
     child.stderr?.on("data", (chunk) => {
-      stderr = append(stderr, chunk);
+      stderr = append(stderr, stderrDecoder.write(chunk));
     });
     child.on("error", (error) => {
       if (settled)
@@ -1896,6 +1929,8 @@ async function runBash(params, cwd) {
         return;
       settled = true;
       clearTimeout(timer);
+      stdout = append(stdout, stdoutDecoder.end());
+      stderr = append(stderr, stderrDecoder.end());
       resolve(ok({
         kind: "bash",
         stdout,
@@ -1922,7 +1957,7 @@ async function machineResult(handler, params, worktreeBase) {
       created = !fs3.existsSync(resolved);
       fs3.mkdirSync(resolved, { recursive: true });
     }
-    return ok({ root, created, checkouts: [] });
+    return ok({ root: root ? path3.resolve(root) : "", created, checkouts: [] });
   }
   if (handler === "worktree_list") {
     return ok({ kind: "worktree_list", entries: [] });
@@ -1990,13 +2025,14 @@ async function machineResult(handler, params, worktreeBase) {
         return fail("MachineServer.FileError", "oldString must be non-empty and differ from newString");
       }
       const text = fs3.readFileSync(file, "utf8");
-      const count = text.split(oldString).length - 1;
+      const parts = text.split(oldString);
+      const count = parts.length - 1;
       if (count === 0)
         return fail("MachineServer.FileError", `The text was not found in ${String(params.path)}`);
       if (count > 1 && params.replaceAll !== true) {
         return fail("MachineServer.FileError", `Found ${count} occurrences; provide more context or replaceAll`);
       }
-      const next = params.replaceAll === true ? text.split(oldString).join(newString) : text.replace(oldString, newString);
+      const next = params.replaceAll === true ? parts.join(newString) : `${parts[0] ?? ""}${newString}${parts.slice(1).join(oldString)}`;
       fs3.writeFileSync(file, next, "utf8");
       return ok({ kind: "edit", path: file, replacements: count, isError: false });
     } catch (error) {
@@ -2054,7 +2090,7 @@ class HeadlessDevice {
       throw new CapyError("upstream_unavailable", "\u5F53\u524D\u8FD0\u884C\u65F6\u6CA1\u6709 WebSocket\uFF08\u9700\u8981 Bun / Node 22+\uFF09");
     }
     this.WebSocketImpl = Impl;
-    this.worktreeBase = options.worktreeBase ?? path3.join(os4.homedir(), ".capy", "worktrees");
+    this.worktreeBase = options.worktreeBase ?? path3.join(os3.homedir(), ".capy", "worktrees");
   }
   get info() {
     return {
@@ -2112,8 +2148,8 @@ class HeadlessDevice {
         type: "hello",
         contractVersion: CONTRACT_VERSION,
         deviceId: this.credential.deviceId,
-        hostname: os4.hostname(),
-        os: deviceOs2(),
+        hostname: os3.hostname(),
+        os: deviceOs(),
         workspaces: [],
         worktreeBase: this.worktreeBase,
         clientVersion: "magpie-headless 1.0"
@@ -2148,13 +2184,10 @@ class HeadlessDevice {
   }
   send(frame) {
     if (!this.ws || this.ws.readyState !== 1)
-      return false;
+      return;
     try {
       this.ws.send(JSON.stringify(frame));
-      return true;
-    } catch {
-      return false;
-    }
+    } catch {}
   }
   sendBinary(bytes) {
     if (!this.ws || this.ws.readyState !== 1)
@@ -2175,11 +2208,12 @@ class HeadlessDevice {
     if (!frame)
       return;
     const stream = this.streams.get(frame.streamId);
-    if (!stream)
+    if (!stream || stream.done)
       return;
-    stream.body = Buffer.concat([stream.body, Buffer.from(frame.body)]);
-    const length = Number(headerValue(stream.headers, "content-length") || 0);
-    if (!length || stream.body.length >= length)
+    const chunk = Buffer.from(frame.body);
+    stream.chunks.push(chunk);
+    stream.received += chunk.length;
+    if (stream.expectedLength > 0 && stream.received >= stream.expectedLength)
       this.runStream(stream);
   }
   onControl(text) {
@@ -2204,13 +2238,31 @@ class HeadlessDevice {
       const streamId = Number(frame.streamId);
       if (!Number.isInteger(streamId))
         return;
+      const headers = {};
+      if (frame.headers && typeof frame.headers === "object") {
+        for (const [key, value] of Object.entries(frame.headers)) {
+          headers[key.toLowerCase()] = String(value);
+        }
+      }
+      const expectedLength = Number(headers["content-length"] ?? 0);
+      const timer = setTimeout(() => {
+        const stream = this.streams.get(streamId);
+        if (!stream || stream.done)
+          return;
+        stream.done = true;
+        this.streams.delete(streamId);
+        this.respond(streamId, 200, fail("MachineServer.Timeout", "machine RPC stream timed out"));
+      }, STREAM_TIMEOUT_MS);
+      timer.unref?.();
       this.streams.set(streamId, {
         streamId,
-        kind: String(frame.kind ?? "invoke"),
-        method: String(frame.method ?? "POST"),
         path: String(frame.path ?? ""),
-        headers: frame.headers && typeof frame.headers === "object" ? frame.headers : {},
-        body: Buffer.alloc(0)
+        headers,
+        expectedLength: Number.isFinite(expectedLength) && expectedLength > 0 ? expectedLength : 0,
+        chunks: [],
+        received: 0,
+        timer,
+        done: false
       });
       return;
     }
@@ -2222,18 +2274,22 @@ class HeadlessDevice {
     }
   }
   runStream(stream) {
+    if (stream.done)
+      return;
+    stream.done = true;
+    if (stream.timer)
+      clearTimeout(stream.timer);
+    stream.timer = null;
     this.handleStream(stream).catch((error) => {
-      this.respond(stream.streamId, 200, {
-        status: "failed",
-        error: { code: "MachineServer.Internal", message: errorText(error) }
-      });
+      this.respond(stream.streamId, 200, fail("MachineServer.Internal", errorText(error)));
     });
   }
   async handleStream(stream) {
     this.streams.delete(stream.streamId);
     let payload = null;
     try {
-      payload = stream.body.length > 0 ? JSON.parse(stream.body.toString("utf8")) : null;
+      const body = stream.chunks.length > 0 ? Buffer.concat(stream.chunks) : Buffer.alloc(0);
+      payload = body.length > 0 ? JSON.parse(body.toString("utf8")) : null;
     } catch {}
     const record = payload && typeof payload === "object" ? payload : {};
     let result;
@@ -2244,8 +2300,8 @@ class HeadlessDevice {
       const params = record.params && typeof record.params === "object" ? record.params : {};
       result = await machineResult(handler, params, this.activeRoot ?? this.worktreeBase);
       if (handler === "worktree_ensure" && result.status === "succeeded") {
-        const root = String(params.root ?? "");
-        if (root)
+        const root = result.result?.root;
+        if (typeof root === "string" && root)
           this.activeRoot = root;
       }
     } else {
@@ -2285,7 +2341,6 @@ class HeadlessDeviceRuntime {
   logger;
   deviceName;
   devices = new Map;
-  inflight = new Map;
   constructor(options) {
     this.app = options.app;
     this.store = options.store;
@@ -2294,17 +2349,7 @@ class HeadlessDeviceRuntime {
     this.deviceName = options.deviceName?.trim() || defaultDeviceName();
   }
   async ensure(session, signal) {
-    const key = accountKey(session);
-    const hit = this.inflight.get(key);
-    if (hit)
-      return await hit;
-    const task = this.ensureOne(session, signal);
-    this.inflight.set(key, task);
-    try {
-      return await task;
-    } finally {
-      this.inflight.delete(key);
-    }
+    return await this.ensureOne(session, signal);
   }
   close() {
     for (const device of this.devices.values())
@@ -2317,7 +2362,7 @@ class HeadlessDeviceRuntime {
     if (existing) {
       try {
         await existing.ensure();
-        return this.infoOf(existing);
+        return existing.info;
       } catch {
         existing.close();
         this.devices.delete(key);
@@ -2356,9 +2401,6 @@ class HeadlessDeviceRuntime {
     this.devices.set(key, device);
     return { id: credential.deviceId, name: credential.name, connected: true };
   }
-  infoOf(device) {
-    return device.info;
-  }
   async connect(credential, signal) {
     let lastError = null;
     for (let attempt = 1;attempt <= 3; attempt += 1) {
@@ -2383,9 +2425,9 @@ class HeadlessDeviceRuntime {
   }
   async pair(session, jwt, signal) {
     const start = await this.app.startDeviceCode(jwt, {
-      hostname: os4.hostname(),
-      os: deviceOs2(),
-      arch: deviceArch2()
+      hostname: os3.hostname(),
+      os: deviceOs(),
+      arch: deviceArch()
     }, signal);
     try {
       await this.app.approveDeviceCode(jwt, session.orgId, start.userCode, this.deviceName, signal);
@@ -2393,14 +2435,16 @@ class HeadlessDeviceRuntime {
       const hint = start.verificationUrl ? `\uFF1B\u53EF\u5728\u6D4F\u89C8\u5668\u6253\u5F00 ${start.verificationUrl} \u624B\u52A8\u6279\u51C6` : "";
       throw new CapyError("device_pair_failed", `Capy \u8BBE\u5907\u7801\u81EA\u52A8\u6279\u51C6\u5931\u8D25\uFF1A${errorText(error)}${hint}`);
     }
-    for (let i = 0;i < 10; i += 1) {
+    let intervalMs = start.pollIntervalSeconds * 1000;
+    const deadline = this.clock.now() + start.expiresInSeconds * 1000;
+    while (this.clock.now() < deadline) {
       let poll;
       try {
         poll = await this.app.pollDeviceCode(jwt, start.deviceCode, signal);
       } catch (error) {
         if (error?.status === 401)
           throw error;
-        await this.clock.sleep(start.pollIntervalSeconds * 1000, signal);
+        await this.clock.sleep(intervalMs, signal);
         continue;
       }
       if (poll.status === "approved") {
@@ -2416,24 +2460,30 @@ class HeadlessDeviceRuntime {
       if (poll.status === "denied" || poll.status === "expired") {
         throw new CapyError("device_pair_failed", `Capy \u8BBE\u5907\u7801\u914D\u5BF9${poll.status === "denied" ? "\u88AB\u62D2\u7EDD" : "\u5DF2\u8FC7\u671F"}`);
       }
-      await this.clock.sleep(start.pollIntervalSeconds * 1000, signal);
+      if (poll.status === "slow_down")
+        intervalMs = Math.min(1e4, Math.round(intervalMs * 1.5));
+      await this.clock.sleep(intervalMs, signal);
     }
     throw new CapyError("upstream_timeout", "\u7B49\u5F85 Capy \u8BBE\u5907\u7801\u6279\u51C6\u8D85\u65F6");
   }
   async waitConnected(jwt, orgId, deviceId, signal) {
-    const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
-      const devices = await this.app.listDevices(jwt, orgId, signal).catch(() => []);
-      const hit = devices.find((device) => device.id === deviceId);
-      if (hit?.connected)
-        return true;
-      await this.clock.sleep(CONNECT_POLL_MS, signal);
+    const deadline = this.clock.now() + 20000;
+    let attempt = 0;
+    while (this.clock.now() < deadline) {
+      try {
+        const devices = await this.app.listDevices(jwt, orgId, signal);
+        const hit = devices.find((device) => device.id === deviceId);
+        if (hit?.connected)
+          return true;
+      } catch (error) {
+        if (signal?.aborted || isAuthError(error))
+          throw error;
+      }
+      attempt += 1;
+      await this.clock.sleep(Math.min(3000, CONNECT_POLL_MS * 2 ** Math.min(attempt, 4)), signal);
     }
     return false;
   }
-}
-function errorText(error) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 // src/protocol/sse.ts
@@ -2465,7 +2515,6 @@ function parseFrame(raw) {
   let event = "";
   let data = "";
   let id = "";
-  let retry;
   for (const line of raw.split(/\r?\n/u)) {
     if (!line || line.startsWith(":"))
       continue;
@@ -2479,20 +2528,10 @@ function parseFrame(raw) {
 ${value}` : value;
     else if (field === "id")
       id = value;
-    else if (field === "retry") {
-      const n = Number(value);
-      if (Number.isFinite(n) && n >= 0)
-        retry = n;
-    }
   }
-  if (!event && !data && retry === undefined)
+  if (!event && !data)
     return null;
-  return {
-    event,
-    data,
-    ...id ? { id } : {},
-    ...retry === undefined ? {} : { retry }
-  };
+  return { event, data, ...id ? { id } : {} };
 }
 async function* decodeSseStream(source) {
   const decoder = new TextDecoder;
@@ -2528,29 +2567,6 @@ function rawModels(items) {
     }];
   });
 }
-function modelDefault(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    return;
-  const record = value;
-  const modelId = typeof record.modelId === "string" ? record.modelId : "";
-  if (!modelId)
-    return;
-  const skipped = Array.isArray(record.skipped) ? record.skipped.flatMap((item) => {
-    if (!item || typeof item !== "object")
-      return [];
-    const s = item;
-    return [{
-      modelId: String(s.modelId ?? ""),
-      source: String(s.source ?? ""),
-      reason: String(s.reason ?? "")
-    }];
-  }) : [];
-  return {
-    modelId,
-    source: typeof record.source === "string" ? record.source : "",
-    ...skipped.length > 0 ? { skipped } : {}
-  };
-}
 
 class CapyPublicClient {
   fetchImpl;
@@ -2558,15 +2574,9 @@ class CapyPublicClient {
     this.fetchImpl = fetchImpl;
   }
   async listModels(apiKey, signal) {
-    const { response, body, text } = await requestJson(this.fetchImpl, `${CAPY_PUBLIC}/models`, { method: "GET", headers: publicHeaders(apiKey), ...signal ? { signal } : {} }, 20000);
-    if (!response.ok)
-      throw mapUpstream(response.status, body, text.slice(0, 300));
+    const body = await requestCapyJson(this.fetchImpl, `${CAPY_PUBLIC}/models`, { method: "GET", headers: publicHeaders(apiKey), ...signal ? { signal } : {} }, 20000);
     const record = body;
-    const fallback = modelDefault(record.default);
-    return {
-      items: rawModels(record.items),
-      ...fallback ? { default: fallback } : {}
-    };
+    return { items: rawModels(record.items) };
   }
   async* streamThread(apiKey, threadId, signal) {
     const url = `${CAPY_PUBLIC}/threads/${encodeURIComponent(threadId)}/stream?until=run`;
@@ -2583,7 +2593,7 @@ class CapyPublicClient {
     } catch (error) {
       if (signal?.aborted)
         throw error;
-      throw new CapyError("upstream_unavailable", `\u8FDE\u63A5 Capy \u6D41\u5931\u8D25\uFF1A${errorText2(error)}`, { cause: error });
+      throw new CapyError("upstream_unavailable", `\u8FDE\u63A5 Capy \u6D41\u5931\u8D25\uFF1A${errorText(error)}`, { cause: error });
     }
     if (!response.ok) {
       const text = await response.text().catch(() => "");
@@ -2598,12 +2608,17 @@ class CapyPublicClient {
     const body = response.body;
     async function* chunks() {
       const reader = body.getReader();
-      for (;; ) {
-        const { done, value } = await reader.read();
-        if (done)
-          return;
-        if (value)
-          yield value;
+      try {
+        for (;; ) {
+          const { done, value } = await reader.read();
+          if (done)
+            return;
+          if (value)
+            yield value;
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
       }
     }
     for await (const frame of decodeSseStream(chunks())) {
@@ -2617,7 +2632,7 @@ class CapyPublicClient {
   async uploadFiles(apiKey, files, signal) {
     if (files.length === 0)
       return [];
-    const { response, body, text } = await requestJson(this.fetchImpl, `${CAPY_PUBLIC}/files`, {
+    const body = await requestCapyJson(this.fetchImpl, `${CAPY_PUBLIC}/files`, {
       method: "POST",
       headers: publicHeaders(apiKey, { "content-type": "application/json" }),
       body: JSON.stringify({
@@ -2629,8 +2644,6 @@ class CapyPublicClient {
       }),
       ...signal ? { signal } : {}
     }, 30000);
-    if (!response.ok)
-      throw mapUpstream(response.status, body, text.slice(0, 300));
     const targets = body?.targets;
     if (!Array.isArray(targets) || targets.length !== files.length) {
       throw new CapyError("upstream_error", "Capy \u6CA1\u6709\u8FD4\u56DE\u8DB3\u591F\u7684\u6587\u4EF6\u4E0A\u4F20\u76EE\u6807");
@@ -2642,14 +2655,13 @@ class CapyPublicClient {
       if (!file || !target || typeof target.fileId !== "string" || typeof target.url !== "string") {
         throw new CapyError("upstream_error", "Capy \u6587\u4EF6\u4E0A\u4F20\u76EE\u6807\u7F3A\u5C11 fileId/url");
       }
+      const timeout = AbortSignal.timeout(60000);
+      const putSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
       const put = await this.fetchImpl(target.url, {
         method: "PUT",
-        headers: {
-          "content-type": file.mediaType,
-          "content-length": String(file.bytes.length)
-        },
+        headers: { "content-type": file.mediaType },
         body: file.bytes,
-        ...signal ? { signal } : {}
+        signal: putSignal
       });
       if (!put.ok) {
         const detail = await put.text().catch(() => "");
@@ -2667,20 +2679,13 @@ class CapyPublicClient {
     return out;
   }
   async usage(apiKey, signal) {
-    const { response, body, text } = await requestJson(this.fetchImpl, `${CAPY_PUBLIC}/usage`, { method: "GET", headers: publicHeaders(apiKey), ...signal ? { signal } : {} }, 20000);
-    if (!response.ok)
-      throw mapUpstream(response.status, body, text.slice(0, 300));
+    const body = await requestCapyJson(this.fetchImpl, `${CAPY_PUBLIC}/usage`, { method: "GET", headers: publicHeaders(apiKey), ...signal ? { signal } : {} }, 20000);
     return body ?? {};
   }
   async balance(apiKey, signal) {
-    const { response, body, text } = await requestJson(this.fetchImpl, `${CAPY_PUBLIC}/usage/balance`, { method: "GET", headers: publicHeaders(apiKey), ...signal ? { signal } : {} }, 20000);
-    if (!response.ok)
-      throw mapUpstream(response.status, body, text.slice(0, 300));
+    const body = await requestCapyJson(this.fetchImpl, `${CAPY_PUBLIC}/usage/balance`, { method: "GET", headers: publicHeaders(apiKey), ...signal ? { signal } : {} }, 20000);
     return body ?? {};
   }
-}
-function errorText2(error) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 // src/observability/redact.ts
@@ -2843,7 +2848,7 @@ function hostMatchesNoProxy(host, noProxy) {
   for (const rule of rules) {
     if (rule === "*")
       return true;
-    const value = rule.replace(/^\./u, "");
+    const value = rule.replace(/^\./u, "").replace(/^\[|\]$/gu, "");
     if (plain === value || plain.endsWith(`.${value}`))
       return true;
   }
@@ -2866,7 +2871,7 @@ function proxyConnectionError(error) {
   return /ECONNREFUSED|ConnectionRefused|Unable to connect|proxy connect|proxy server/iu.test(String(error?.message ?? error));
 }
 function createProxyFetch(baseFetch, proxyUrl, options = {}) {
-  const url = normalizeProxyUrl(proxyUrl);
+  const url = proxyUrl;
   if (!url)
     return baseFetch;
   let warned = false;
@@ -2882,7 +2887,7 @@ function createProxyFetch(baseFetch, proxyUrl, options = {}) {
     const target = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     let host = "";
     try {
-      host = new URL(target).hostname;
+      host = new URL(target).hostname.replace(/^\[|\]$/gu, "");
     } catch {}
     if (host && (LOCAL_HOSTS.has(host) || hostMatchesNoProxy(host, process.env.NO_PROXY ?? process.env.no_proxy))) {
       return baseFetch(input, init);
@@ -2921,10 +2926,9 @@ function createProxyFetch(baseFetch, proxyUrl, options = {}) {
       const withDispatcher = { ...init, dispatcher: undiciAgent };
       try {
         return await baseFetch(input, withDispatcher);
-      } catch {
-        try {
-          return await baseFetch(input, { ...init, proxy: url });
-        } catch {}
+      } catch (error) {
+        warn(`\u4EE3\u7406 ${url} \u8BF7\u6C42\u5931\u8D25\uFF0C\u672C\u6B21\u76F4\u8FDE\uFF1A${error instanceof Error ? error.message : String(error)}`);
+        return baseFetch(input, init);
       }
     }
     warn(`\u68C0\u6D4B\u5230\u4EE3\u7406 ${url}\uFF0C\u4F46\u5F53\u524D Node \u8FD0\u884C\u65F6\u4E0D\u652F\u6301 fetch \u4EE3\u7406\uFF08\u672A\u5B89\u88C5 undici\uFF09\u3002` + "\u8BF7\u6539\u7528 magpie \u81EA\u5E26 Bun \u8FD0\u884C\u65F6\uFF0C\u6216\u8BBE\u7F6E NODE_OPTIONS=--use-env-proxy \u540E\u91CD\u542F\u3002");
@@ -3023,16 +3027,16 @@ function sessionOfAuth(auth) {
   if (!refresh)
     throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u6001\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
   const metadata = record.metadata && typeof record.metadata === "object" && !Array.isArray(record.metadata) ? record.metadata : {};
-  const orgId = refresh.orgId ?? (typeof metadata.orgId === "string" ? metadata.orgId : "");
+  const orgId = refresh.orgId || (typeof metadata.orgId === "string" ? metadata.orgId : "");
   if (!orgId)
     throw new CapyError("sign_in_required", "Capy \u767B\u5F55\u6001\u7F3A\u5C11\u7EC4\u7EC7\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
-  const uid = refresh.userId ?? (typeof metadata.userId === "string" ? metadata.userId : "") ?? (typeof record.uid === "string" ? record.uid : "");
+  const uid = refresh.userId || (typeof metadata.userId === "string" ? metadata.userId : "") || (typeof record.uid === "string" ? record.uid : "");
   const accountId = typeof record.accountId === "string" && record.accountId ? record.accountId : uid || access.slice(-8);
   return {
     accountId,
     uid,
     orgId,
-    clientId: refresh.clientId ?? (typeof metadata.clientId === "string" ? metadata.clientId : ""),
+    clientId: refresh.clientId || (typeof metadata.clientId === "string" ? metadata.clientId : ""),
     accessToken: access,
     clerk: { clientJwt: refresh.clientJwt, sessionId: refresh.sessionId },
     source: "refresh",
@@ -3051,7 +3055,7 @@ function authRecordOf(session) {
       userId: session.uid,
       clientId: session.clientId
     }),
-    expires: Date.now() + 7 * 24 * 3600000,
+    expires: Date.now() + SESSION_TTL_MS,
     accountId: session.accountId,
     uid: session.uid,
     metadata: {
@@ -3064,167 +3068,7 @@ function authRecordOf(session) {
   };
 }
 
-// src/application/attachments.ts
-var MAX_ATTACHMENT_BYTES = 262144000;
-var DATA_URL = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/u;
-var BARE_BASE64 = /^[A-Za-z0-9+/]+={0,2}$/u;
-var PRIVATE_HOST = /^(?:localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.|::1$|\[::1\]$|\[::\]$|fe80:|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|.*\.local$)/iu;
-function mediaTypeOf(value, fallback = "application/octet-stream") {
-  const text = String(value ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
-  return /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/u.test(text) ? text : fallback;
-}
-function safeName(name, mediaType, index) {
-  const base = String(name ?? "").split(/[\\/]/u).pop()?.replace(/[\u0000-\u001f<>:"|?*]/gu, "").trim();
-  if (base)
-    return base.slice(0, 200);
-  const ext = mediaType.split("/")[1]?.replace(/[^a-z0-9]/giu, "") || "bin";
-  return `attachment-${index + 1}.${ext}`;
-}
-function assertSize(bytes, name) {
-  if (bytes.length > MAX_ATTACHMENT_BYTES) {
-    throw new CapyError("invalid_request", `\u9644\u4EF6 ${name} \u8D85\u8FC7 250 MB\uFF08\u5355\u6587\u4EF6\u4E0A\u9650\uFF09`);
-  }
-}
-function decodeDataUrl(value, fallbackType) {
-  const match = DATA_URL.exec(value);
-  if (!match)
-    return null;
-  const mediaType = mediaTypeOf(match[1], fallbackType);
-  const bytes = match[2] ? Buffer.from(match[3] ?? "", "base64") : Buffer.from(decodeURIComponent(match[3] ?? ""), "utf8");
-  return { mediaType, bytes };
-}
-function assertPublicUrl(raw) {
-  let url;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new CapyError("invalid_request", "\u9644\u4EF6 URL \u4E0D\u662F\u5408\u6CD5\u5730\u5740");
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new CapyError("invalid_request", "\u9644\u4EF6\u53EA\u652F\u6301 http/https URL \u6216 data URL");
-  }
-  if (PRIVATE_HOST.test(url.hostname)) {
-    throw new CapyError("invalid_request", "\u9644\u4EF6 URL \u6307\u5411\u672C\u673A/\u5185\u7F51\u5730\u5740\uFF0C\u5DF2\u62D2\u7EDD\uFF08SSRF\uFF09");
-  }
-  return url;
-}
-async function readRemote(fetchImpl, raw, name, signal) {
-  const url = assertPublicUrl(raw);
-  let response;
-  try {
-    response = await fetchImpl(url.toString(), {
-      method: "GET",
-      headers: { accept: "image/*,application/pdf,*/*;q=0.8" },
-      redirect: "follow",
-      ...signal ? { signal } : {}
-    });
-  } catch (error) {
-    throw new CapyError("upstream_unavailable", `\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`, { cause: error });
-  }
-  if (!response.ok)
-    throw new CapyError("invalid_request", `\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
-  const length = Number(response.headers.get("content-length") ?? 0);
-  if (length > MAX_ATTACHMENT_BYTES)
-    throw new CapyError("invalid_request", "\u8FDC\u7A0B\u9644\u4EF6\u8D85\u8FC7 250 MB");
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  assertSize(bytes, name);
-  return {
-    name: safeName(name || url.pathname.split("/").pop(), mediaTypeOf(response.headers.get("content-type")), 0),
-    mediaType: mediaTypeOf(response.headers.get("content-type")),
-    bytes
-  };
-}
-async function resolvePart(fetchImpl, part, index, signal) {
-  const fallbackType = part.type === "image_url" || part.type === "input_image" || part.type === "image" ? "image/png" : part.mediaType ?? "application/octet-stream";
-  const isImagePart = part.type === "image_url" || part.type === "input_image" || part.type === "image";
-  const source = isImagePart ? part.url : ("data" in part) && typeof part.data === "string" ? part.data : part.url ?? "";
-  const name = safeName(part.name, fallbackType, index);
-  if (!source)
-    throw new CapyError("invalid_request", "\u9644\u4EF6\u7F3A\u5C11\u5185\u5BB9\uFF08data URL / http(s) URL / base64\uFF09");
-  if (source.startsWith("data:")) {
-    const decoded = decodeDataUrl(source, fallbackType);
-    if (!decoded)
-      throw new CapyError("invalid_request", "\u9644\u4EF6 data URL \u65E0\u6CD5\u89E3\u6790");
-    assertSize(decoded.bytes, name);
-    return { name, mediaType: decoded.mediaType, bytes: decoded.bytes };
-  }
-  if (/^https?:\/\//iu.test(source)) {
-    return readRemote(fetchImpl, source, name, signal);
-  }
-  const text = source.trim();
-  if (BARE_BASE64.test(text) && text.length % 4 === 0) {
-    const bytes = Buffer.from(text, "base64");
-    assertSize(bytes, name);
-    return { name, mediaType: fallbackType, bytes };
-  }
-  throw new CapyError("invalid_request", "\u9644\u4EF6\u5185\u5BB9\u4E0D\u662F data URL / http(s) URL / base64");
-}
-async function collectAttachments(messages, options) {
-  const cleaned = [];
-  const attachments = [];
-  for (const message of messages) {
-    if (typeof message.content === "string") {
-      cleaned.push(message);
-      continue;
-    }
-    const parts = [];
-    for (const part of message.content) {
-      if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
-        parts.push(part);
-        continue;
-      }
-      if (part.type === "image_url" || part.type === "input_image" || part.type === "image" || part.type === "file" || part.type === "input_file") {
-        const attachment = await resolvePart(options.fetchImpl, part, attachments.length, options.signal);
-        attachments.push(attachment);
-        const image = /^image\//u.test(attachment.mediaType);
-        parts.push({
-          type: "text",
-          text: `${image ? "[\u56FE\u7247" : "[\u9644\u4EF6"}: ${attachment.name}]`
-        });
-        continue;
-      }
-    }
-    cleaned.push({ ...message, content: parts });
-  }
-  return { messages: cleaned, attachments };
-}
-
-// src/application/device.ts
-class DeviceUseCase {
-  runtime;
-  inflight = new Map;
-  constructor(runtime) {
-    this.runtime = runtime;
-  }
-  async ensure(session, signal) {
-    const key = accountKey(session);
-    const hit = this.inflight.get(key);
-    if (hit)
-      return await hit;
-    const task = this.runtime.ensure(session, signal);
-    this.inflight.set(key, task);
-    try {
-      return await task;
-    } finally {
-      this.inflight.delete(key);
-    }
-  }
-  close() {
-    this.inflight.clear();
-    this.runtime.close();
-  }
-}
-
 // src/domain/model.ts
-var FREE_MODEL_IDS = new Set([
-  "particle/particle-1",
-  "zai/glm-5.3-flash-ads",
-  "deepseek/deepseek-v4.1-flash-ads"
-]);
-var ADS_MODEL_IDS = new Set([
-  "zai/glm-5.3-flash-ads",
-  "deepseek/deepseek-v4.1-flash-ads"
-]);
 var EXTRA_FREE_MODELS = [
   {
     id: "zai/glm-5.3-flash-ads",
@@ -3237,15 +3081,13 @@ var EXTRA_FREE_MODELS = [
     reasoningModes: ["none", "low", "high", "max"]
   }
 ];
+var ADS_MODEL_IDS = new Set(EXTRA_FREE_MODELS.map((model) => model.id));
+var FREE_MODEL_IDS = new Set(["particle/particle-1", ...ADS_MODEL_IDS]);
 function isFreeModel(id) {
   return FREE_MODEL_IDS.has(String(id).trim());
 }
 function isAdsModel(id) {
   return ADS_MODEL_IDS.has(String(id).trim());
-}
-function vendorOf(id) {
-  const slash = id.indexOf("/");
-  return slash > 0 ? id.slice(0, slash) : "capy";
 }
 function normalizeModes(modes) {
   if (!modes)
@@ -3265,7 +3107,6 @@ function describeModel(raw, options) {
   return {
     id,
     name,
-    vendor: vendorOf(id),
     free: isFreeModel(id),
     reasoningModes,
     capabilities: {
@@ -3284,7 +3125,7 @@ function mergeCatalog(live, extras = EXTRA_FREE_MODELS) {
 function freeFirst(models) {
   return [...models].sort((a, b) => Number(isFreeModel(b.id)) - Number(isFreeModel(a.id)));
 }
-function resolveModelId(requested, models) {
+function resolveModel(requested, models) {
   const wanted = typeof requested === "string" ? requested.trim() : "";
   if (!wanted)
     throw new CapyError("invalid_request", "\u7F3A\u5C11 model");
@@ -3294,16 +3135,16 @@ function resolveModelId(requested, models) {
   const target = strip(wanted);
   const byId = models.find((model) => model.id === wanted || model.id === target);
   if (byId)
-    return byId.id;
+    return byId;
   const short = target.split("/").pop() ?? target;
   const byShort = models.find((model) => (model.id.split("/").pop() ?? model.id) === short);
   if (byShort)
-    return byShort.id;
+    return byShort;
   const normalize = (value) => value.toLowerCase().replace(/[\s._-]+/gu, "");
   const norm = normalize(target);
   const byName = models.find((model) => normalize(model.name) === norm || normalize(model.id) === norm);
   if (byName)
-    return byName.id;
+    return byName;
   throw new CapyError("model_not_found", `Capy \u4E0D\u8BA4\u8BC6\u6A21\u578B "${wanted}"`, { detail: wanted });
 }
 function reasoningModeOf(request, model) {
@@ -3313,60 +3154,75 @@ function reasoningModeOf(request, model) {
   return model.reasoningModes.includes(raw) ? raw : "";
 }
 
-// src/application/catalog.ts
-var DEFAULT_TTL_MS = 10 * 60000;
-
-class CatalogUseCase {
-  options;
-  constructor(options) {
-    this.options = options;
-  }
-  async load(apiKey, signal) {
-    const cacheKey = `catalog:${apiKey.slice(-16)}`;
-    const hit = this.options.cache?.get(cacheKey);
-    if (hit)
-      return hit;
-    const snapshot = await this.loadSnapshot(apiKey, signal);
-    this.options.cache?.set(cacheKey, snapshot, this.options.cacheTtlMs ?? DEFAULT_TTL_MS);
-    return snapshot;
-  }
-  async loadSnapshot(apiKey, signal) {
-    try {
-      const live = await this.options.publicPort.listModels(apiKey, signal);
-      return {
-        models: this.describe(freeFirst(mergeCatalog(live.items, EXTRA_FREE_MODELS))),
-        ...live.default ? { default: live.default } : {}
-      };
-    } catch (error) {
-      if (isAuthError(error))
-        throw error;
-      if (this.options.fallback.length === 0) {
-        throw new CapyError("upstream_unavailable", "Capy \u6A21\u578B\u76EE\u5F55\u4E0D\u53EF\u7528", { cause: error });
-      }
-      return {
-        models: this.describe(freeFirst(mergeCatalog(this.options.fallback, EXTRA_FREE_MODELS)))
-      };
-    }
-  }
-  describe(raw) {
-    return freeFirst(raw.map((item) => describeModel(item, { toolsEnabled: this.options.toolsEnabled })));
-  }
+// src/entry/magpie-models.ts
+var SDK = "@ai-sdk/openai-compatible";
+function toMagpieModel(model, providerId) {
+  const variants = model.reasoningModes.length > 0 ? Object.fromEntries(model.reasoningModes.map((mode) => [mode, {}])) : undefined;
+  const ads = isAdsModel(model.id);
+  return {
+    id: model.id,
+    providerID: providerId,
+    name: ads ? `${model.name} \xB7 US/CA/UK/AU/NZ/IE` : model.name,
+    ...ads ? { description: "Free with ads \u2014 only US / CA / UK / AU / NZ / IE egress IP" } : {},
+    free: model.free,
+    tool_call: model.capabilities.tools,
+    attachment: model.capabilities.attachment,
+    api: { id: model.id, url: CAPY_PUBLIC, npm: SDK },
+    status: "active",
+    headers: {},
+    options: {},
+    limit: {},
+    modalities: { input: ["text", ...model.capabilities.image ? ["image"] : []], output: ["text"] },
+    capabilities: {
+      temperature: false,
+      reasoning: model.reasoningModes.length > 0,
+      attachment: model.capabilities.attachment,
+      toolcall: model.capabilities.tools,
+      input: {
+        text: model.capabilities.text,
+        image: model.capabilities.image,
+        audio: false,
+        video: false,
+        pdf: model.capabilities.pdf
+      },
+      output: { text: true, image: false, audio: false, video: false, pdf: false },
+      interleaved: false
+    },
+    ...variants ? { variants } : {}
+  };
+}
+function modelMap(models, providerId) {
+  return Object.fromEntries(models.map((model) => [model.id, toMagpieModel(model, providerId)]));
+}
+function staticModels(providerId, toolsEnabled) {
+  const models = freeFirst(mergeCatalog(STATIC_CATALOG, EXTRA_FREE_MODELS).map((raw) => describeModel(raw, { toolsEnabled })));
+  return modelMap(models, providerId);
 }
 
 // src/domain/chat.ts
+function isTextPart(part) {
+  return part.type === "text" || part.type === "input_text" || part.type === "output_text";
+}
+function isImagePart(part) {
+  return part.type === "image_url" || part.type === "input_image" || part.type === "image";
+}
+function isFilePart(part) {
+  return part.type === "file" || part.type === "input_file";
+}
+function partMarker(part) {
+  if (isImagePart(part))
+    return `[\u56FE\u7247: ${part.name ?? "image"}]`;
+  return `[\u9644\u4EF6: ${part.name ?? "file"}]`;
+}
 function textOfContent(content) {
   if (typeof content === "string")
     return content;
   const parts = [];
   for (const part of content) {
-    if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
+    if (isTextPart(part))
       parts.push(part.text);
-    } else if (part.type === "image_url" || part.type === "input_image" || part.type === "image") {
-      parts.push(`[\u56FE\u7247: ${part.name ?? "image"}]`);
-    } else {
-      const name = "name" in part && typeof part.name === "string" ? part.name : "file";
-      parts.push(`[\u9644\u4EF6: ${name}]`);
-    }
+    else
+      parts.push(partMarker(part));
   }
   return parts.join(`
 `);
@@ -3451,6 +3307,300 @@ function promptError(message) {
   return new CapyError("invalid_request", message);
 }
 
+// src/application/attachments.ts
+var MAX_ATTACHMENT_BYTES = 262144000;
+var MAX_REDIRECTS = 3;
+var REMOTE_TIMEOUT_MS = 30000;
+var DATA_URL = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/u;
+var BARE_BASE64 = /^[A-Za-z0-9+/]+={0,2}$/u;
+var PRIVATE_HOST = /^(?:localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.|::1$|\[::1\]$|\[::\]$|fe80:|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|.*\.local$)/iu;
+function mediaTypeOf(value, fallback = "application/octet-stream") {
+  const text = String(value ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+  return /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/u.test(text) ? text : fallback;
+}
+function safeName(name, mediaType, index) {
+  const base = String(name ?? "").split(/[\\/]/u).pop()?.replace(/[\u0000-\u001f<>:"|?*]/gu, "").trim();
+  if (base)
+    return base.slice(0, 200);
+  const ext = mediaType.split("/")[1]?.replace(/[^a-z0-9]/giu, "") || "bin";
+  return `attachment-${index + 1}.${ext}`;
+}
+function assertSize(bytes, name) {
+  if (bytes.length > MAX_ATTACHMENT_BYTES) {
+    throw new CapyError("invalid_request", `\u9644\u4EF6 ${name} \u8D85\u8FC7 250 MB\uFF08\u5355\u6587\u4EF6\u4E0A\u9650\uFF09`);
+  }
+}
+function decodeDataUrl(value, fallbackType) {
+  const match = DATA_URL.exec(value);
+  if (!match)
+    throw new CapyError("invalid_request", "\u9644\u4EF6 data URL \u65E0\u6CD5\u89E3\u6790");
+  const mediaType = mediaTypeOf(match[1], fallbackType);
+  try {
+    const payload = match[3] ?? "";
+    if (match[2]) {
+      if (!BARE_BASE64.test(payload) || payload.length % 4 !== 0) {
+        throw new Error("invalid base64");
+      }
+      return { mediaType, bytes: Buffer.from(payload, "base64") };
+    }
+    return { mediaType, bytes: Buffer.from(decodeURIComponent(payload), "utf8") };
+  } catch (error) {
+    throw new CapyError("invalid_request", "\u9644\u4EF6 data URL \u5185\u5BB9\u65E0\u6CD5\u89E3\u7801", { cause: error });
+  }
+}
+function assertPublicUrl(raw) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new CapyError("invalid_request", "\u9644\u4EF6 URL \u4E0D\u662F\u5408\u6CD5\u5730\u5740");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new CapyError("invalid_request", "\u9644\u4EF6\u53EA\u652F\u6301 http/https URL \u6216 data URL");
+  }
+  if (PRIVATE_HOST.test(url.hostname)) {
+    throw new CapyError("invalid_request", "\u9644\u4EF6 URL \u6307\u5411\u672C\u673A/\u5185\u7F51\u5730\u5740\uFF0C\u5DF2\u62D2\u7EDD\uFF08SSRF\uFF09");
+  }
+  return url;
+}
+function timeoutSignal(parent) {
+  const controller = new AbortController;
+  const timer = setTimeout(() => controller.abort(), REMOTE_TIMEOUT_MS);
+  timer.unref?.();
+  const onAbort = () => controller.abort();
+  if (parent) {
+    if (parent.aborted)
+      controller.abort();
+    else
+      parent.addEventListener("abort", onAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timer);
+      parent?.removeEventListener("abort", onAbort);
+    }
+  };
+}
+async function fetchWithSafeRedirects(fetchImpl, raw, signal) {
+  let url = assertPublicUrl(raw);
+  for (let hop = 0;hop <= MAX_REDIRECTS; hop += 1) {
+    const response = await fetchImpl(url.toString(), {
+      method: "GET",
+      headers: { accept: "image/*,application/pdf,*/*;q=0.8" },
+      redirect: "manual",
+      ...signal ? { signal } : {}
+    });
+    if (response.status < 300 || response.status >= 400)
+      return response;
+    const location = response.headers.get("location");
+    if (!location)
+      return response;
+    if (hop === MAX_REDIRECTS) {
+      throw new CapyError("invalid_request", "\u8FDC\u7A0B\u9644\u4EF6\u91CD\u5B9A\u5411\u6B21\u6570\u8FC7\u591A");
+    }
+    url = assertPublicUrl(new URL(location, url).toString());
+  }
+  throw new CapyError("invalid_request", "\u8FDC\u7A0B\u9644\u4EF6\u91CD\u5B9A\u5411\u6B21\u6570\u8FC7\u591A");
+}
+async function readLimitedBody(response, name) {
+  const length = Number(response.headers.get("content-length") ?? 0);
+  if (length > MAX_ATTACHMENT_BYTES) {
+    throw new CapyError("invalid_request", `\u9644\u4EF6 ${name} \u8D85\u8FC7 250 MB\uFF08\u5355\u6587\u4EF6\u4E0A\u9650\uFF09`);
+  }
+  if (!response.body)
+    return new Uint8Array;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;; ) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      total += value.byteLength;
+      if (total > MAX_ATTACHMENT_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new CapyError("invalid_request", `\u9644\u4EF6 ${name} \u8D85\u8FC7 250 MB\uFF08\u5355\u6587\u4EF6\u4E0A\u9650\uFF09`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+}
+async function readRemote(fetchImpl, raw, name, signal) {
+  const timeout = timeoutSignal(signal);
+  try {
+    let response;
+    try {
+      response = await fetchWithSafeRedirects(fetchImpl, raw, timeout.signal);
+    } catch (error) {
+      if (signal?.aborted)
+        throw error;
+      if (error instanceof CapyError)
+        throw error;
+      throw new CapyError("upstream_unavailable", "\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u5931\u8D25", { cause: error });
+    }
+    if (!response.ok) {
+      throw new CapyError("invalid_request", `\u4E0B\u8F7D\u8FDC\u7A0B\u9644\u4EF6\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
+    }
+    const mediaType = mediaTypeOf(response.headers.get("content-type"));
+    const bytes = await readLimitedBody(response, name);
+    assertSize(bytes, name);
+    return {
+      candidate: { name, mediaType, bytes },
+      marker: `${/^image\//u.test(mediaType) ? "[\u56FE\u7247" : "[\u9644\u4EF6"}: ${name}]`
+    };
+  } finally {
+    timeout.cleanup();
+  }
+}
+async function resolvePart(fetchImpl, part, index, signal) {
+  const image = isImagePart(part);
+  const fallbackType = image ? "image/png" : part.mediaType ?? "application/octet-stream";
+  const source = image ? part.url : part.data ?? part.url ?? "";
+  const name = safeName(part.name, fallbackType, index);
+  if (!source)
+    throw new CapyError("invalid_request", "\u9644\u4EF6\u7F3A\u5C11\u5185\u5BB9\uFF08data URL / http(s) URL / base64\uFF09");
+  if (source.startsWith("data:")) {
+    const decoded = decodeDataUrl(source, fallbackType);
+    assertSize(decoded.bytes, name);
+    const marker = `${/^image\//u.test(decoded.mediaType) ? "[\u56FE\u7247" : "[\u9644\u4EF6"}: ${name}]`;
+    return { candidate: { name, mediaType: decoded.mediaType, bytes: decoded.bytes }, marker };
+  }
+  if (/^https?:\/\//iu.test(source)) {
+    return readRemote(fetchImpl, source, name, signal);
+  }
+  const text = source.trim();
+  if (BARE_BASE64.test(text) && text.length % 4 === 0) {
+    const bytes = Buffer.from(text, "base64");
+    assertSize(bytes, name);
+    const marker = `${/^image\//u.test(fallbackType) ? "[\u56FE\u7247" : "[\u9644\u4EF6"}: ${name}]`;
+    return { candidate: { name, mediaType: fallbackType, bytes }, marker };
+  }
+  throw new CapyError("invalid_request", "\u9644\u4EF6\u5185\u5BB9\u4E0D\u662F data URL / http(s) URL / base64");
+}
+async function collectAttachments(messages, options) {
+  const plans = [];
+  let attachmentIndex = 0;
+  for (let mi = 0;mi < messages.length; mi += 1) {
+    const message = messages[mi];
+    if (!message || typeof message.content === "string")
+      continue;
+    for (let pi = 0;pi < message.content.length; pi += 1) {
+      const part = message.content[pi];
+      if (!part || isTextPart(part))
+        continue;
+      if (!isImagePart(part) && !isFilePart(part))
+        continue;
+      plans.push({ message: mi, part: pi, value: part, attachmentIndex });
+      attachmentIndex += 1;
+    }
+  }
+  const resolved = await Promise.all(plans.map((plan) => resolvePart(options.fetchImpl, plan.value, plan.attachmentIndex, options.signal)));
+  const byPart = new Map;
+  for (let i = 0;i < plans.length; i += 1) {
+    const plan = plans[i];
+    const value = resolved[i];
+    if (plan && value)
+      byPart.set(`${plan.message}:${plan.part}`, value);
+  }
+  const cleaned = [];
+  for (let mi = 0;mi < messages.length; mi += 1) {
+    const message = messages[mi];
+    if (!message)
+      continue;
+    if (typeof message.content === "string") {
+      cleaned.push(message);
+      continue;
+    }
+    const parts = [];
+    for (let pi = 0;pi < message.content.length; pi += 1) {
+      const part = message.content[pi];
+      if (!part)
+        continue;
+      if (isTextPart(part)) {
+        parts.push(part);
+        continue;
+      }
+      const hit = byPart.get(`${mi}:${pi}`);
+      if (hit)
+        parts.push({ type: "text", text: hit.marker });
+    }
+    cleaned.push({ ...message, content: parts });
+  }
+  return { messages: cleaned, attachments: resolved.map((item) => item.candidate) };
+}
+
+// src/application/device.ts
+class DeviceUseCase {
+  runtime;
+  inflight = new Map;
+  constructor(runtime) {
+    this.runtime = runtime;
+  }
+  async ensure(session, signal) {
+    const key = accountKey(session);
+    const hit = this.inflight.get(key);
+    if (hit)
+      return await hit;
+    const task = this.runtime.ensure(session, signal);
+    this.inflight.set(key, task);
+    try {
+      return await task;
+    } finally {
+      this.inflight.delete(key);
+    }
+  }
+  close() {
+    this.inflight.clear();
+    this.runtime.close();
+  }
+}
+
+// src/application/catalog.ts
+var DEFAULT_TTL_MS = 10 * 60000;
+
+class CatalogUseCase {
+  options;
+  constructor(options) {
+    this.options = options;
+  }
+  async load(apiKey, signal, accountKey2) {
+    if (signal?.aborted)
+      throw new DOMException("Aborted", "AbortError");
+    const cacheKey = `catalog:${accountKey2 ?? apiKey.slice(-16)}`;
+    const hit = this.options.cache?.get(cacheKey);
+    if (hit)
+      return hit;
+    const snapshot = await this.loadSnapshot(apiKey, signal);
+    this.options.cache?.set(cacheKey, snapshot, this.options.cacheTtlMs ?? DEFAULT_TTL_MS);
+    return snapshot;
+  }
+  async loadSnapshot(apiKey, signal) {
+    try {
+      const live = await this.options.publicPort.listModels(apiKey, signal);
+      return { models: this.describe(live.items) };
+    } catch (error) {
+      if (isAbort(error) || signal?.aborted)
+        throw error;
+      if (isAuthError(error))
+        throw error;
+      if (this.options.fallback.length === 0) {
+        throw new CapyError("upstream_unavailable", "Capy \u6A21\u578B\u76EE\u5F55\u4E0D\u53EF\u7528", { cause: error });
+      }
+      return { models: this.describe(this.options.fallback) };
+    }
+  }
+  describe(raw) {
+    return freeFirst(mergeCatalog(raw).map((item) => describeModel(item, {
+      toolsEnabled: this.options.toolsEnabled
+    })));
+  }
+}
+
 // src/application/stream.ts
 class PublicSseNormalizer {
   partial = new Map;
@@ -3533,23 +3683,8 @@ class PublicSseNormalizer {
     const code = typeof payload?.code === "string" ? payload.code : "";
     const message = typeof payload?.message === "string" && payload.message ? payload.message : "Capy \u539F\u751F\u6D41\u8FD4\u56DE\u9519\u8BEF";
     this.errored = true;
-    return [{ type: "error", error: mapStreamError(code, message) }];
+    return [{ type: "error", error: mapCapyCode(code, message) }];
   }
-}
-function mapStreamError(code, message) {
-  if (code === "region_unsupported") {
-    return new CapyError("region_unsupported", message, { detail: code });
-  }
-  if (code === "unauthorized") {
-    return new CapyError("sign_in_required", message, { detail: code });
-  }
-  if (code === "forbidden") {
-    return new CapyError("upstream_error", message, { status: 403, detail: code });
-  }
-  if (code === "rate_limited") {
-    return new CapyError("rate_limited", message, { detail: code });
-  }
-  return new CapyError("upstream_error", message, { detail: code });
 }
 function parseJson(value) {
   if (!value)
@@ -3606,7 +3741,7 @@ class ChatUseCase {
       throw new CapyError("upstream_unavailable", "Capy \u6CA1\u6709\u628A\u7EBF\u7A0B\u653E\u5230\u65E0\u5934\u8BBE\u5907\uFF08\u8FD4\u56DE\u4E86\u4E91\u7AEF\u673A\u5668\uFF09");
     }
     run.onThread?.(thread);
-    const detail = await this.options.app.getJam(jwt, session.orgId, thread.id, run.signal);
+    const detail = await this.options.app.getJam(jwt, session.orgId, thread.id, run.signal).catch(() => null);
     const blocked = askError(detail);
     if (blocked)
       throw blocked;
@@ -3634,16 +3769,18 @@ class ChatUseCase {
         throw error;
       yield {
         type: "error",
-        error: new CapyError("upstream_unavailable", errorMessage(error), { cause: error })
+        error: new CapyError("upstream_unavailable", errorText(error), { cause: error })
       };
     }
   }
   async jamFailure(jwt, orgId, jamId, signal) {
-    const detail = await this.options.app.getJam(jwt, orgId, jamId, signal).catch(() => null);
+    const detail = await this.options.app.getJam(jwt, orgId, jamId, signal).catch((error) => {
+      throw error instanceof CapyError ? error : new CapyError("upstream_unavailable", `\u67E5\u8BE2 Capy \u7EBF\u7A0B\u72B6\u6001\u5931\u8D25\uFF1A${errorText(error)}`, { cause: error });
+    });
     const blocked = askError(detail);
     if (blocked)
       return blocked;
-    if (detail?.status !== "failed")
+    if (detail.status !== "failed")
       return null;
     const events = await this.options.app.getJamEvents(jwt, orgId, jamId, signal).catch(() => []);
     for (const event of [...events].reverse()) {
@@ -3651,7 +3788,7 @@ class ChatUseCase {
         continue;
       const code = event.payload?.code ?? "";
       const message = event.payload?.message ?? "Capy \u7EBF\u7A0B\u5931\u8D25";
-      return mapJamError(code, message);
+      return mapCapyCode(code, message);
     }
     return new CapyError("upstream_error", "Capy \u7EBF\u7A0B\u5931\u8D25\uFF0C\u4F46\u6CA1\u6709\u8FD4\u56DE\u9519\u8BEF\u8BE6\u60C5");
   }
@@ -3663,12 +3800,16 @@ class ChatUseCase {
   }
   async sessionJwt(session, signal) {
     const key = `${accountKey(session)}:${session.clerk.sessionId}`;
-    const hit = this.jwtCache.get(key);
     const now = this.options.clock.now();
-    if (hit && hit.expiresAt > now)
+    for (const [cachedKey, entry] of this.jwtCache) {
+      if (entry.expiresAt <= now)
+        this.jwtCache.delete(cachedKey);
+    }
+    const hit = this.jwtCache.get(key);
+    if (hit)
       return hit.jwt;
     const jwt = await this.options.app.sessionJwt(session.clerk, signal);
-    this.jwtCache.set(key, { jwt, expiresAt: now + JWT_TTL_MS });
+    this.jwtCache.set(key, { jwt, expiresAt: this.options.clock.now() + JWT_TTL_MS });
     return jwt;
   }
 }
@@ -3683,27 +3824,6 @@ function askError(detail) {
     return new CapyError("upstream_unavailable", ask.text || "Capy \u7EBF\u7A0B\u9700\u8981\u4EBA\u5DE5/\u684C\u9762\u7AEF\u64CD\u4F5C");
   }
   return new CapyError("upstream_error", ask.text || `Capy \u7EBF\u7A0B\u963B\u585E\uFF1A${ask.kind}`);
-}
-function mapJamError(code, message) {
-  if (code === "region_unsupported")
-    return new CapyError("region_unsupported", message, { detail: code });
-  if (code === "unauthorized")
-    return new CapyError("sign_in_required", message, { detail: code });
-  if (code === "forbidden")
-    return new CapyError("upstream_error", message, { status: 403, detail: code });
-  if (code === "rate_limited")
-    return new CapyError("rate_limited", message, { detail: code });
-  if (/quota|credit/iu.test(code))
-    return new CapyError("insufficient_quota", message, { detail: code });
-  if (/ModelSelection/iu.test(code))
-    return new CapyError("model_not_found", message, { detail: code });
-  return new CapyError("upstream_error", message, { detail: code });
-}
-function isAbort(error) {
-  return error instanceof DOMException && error.name === "AbortError";
-}
-function errorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 // src/application/login.ts
@@ -3724,9 +3844,14 @@ class LoginUseCase {
     const jwt = await this.options.app.sessionJwt(clerk, signal);
     const me = await this.options.app.me(jwt, signal);
     const orgs = await this.options.app.organizations(jwt, signal);
+    const ids = orgs.map((org) => org.id);
+    const wanted = String(credential.orgId ?? "").trim();
+    if (wanted && !ids.includes(wanted)) {
+      throw new CapyError("invalid_request", `\u767B\u5F55\u51ED\u636E\u6307\u5B9A\u7684\u7EC4\u7EC7 ${wanted} \u4E0D\u5728\u8D26\u53F7\u7EC4\u7EC7\u5217\u8868\u91CC`);
+    }
     const orgId = pickOrg(orgs, credential.orgId, me.preferredOrgId);
     if (!orgId) {
-      throw new CapyError("invalid_request", "\u8FD9\u4E2A Capy \u8D26\u53F7\u6CA1\u6709\u7EC4\u7EC7\uFF08org\uFF09\uFF0C\u8BF7\u5148\u5728 Capy \u91CC\u5B8C\u6210\u521D\u59CB\u5316");
+      throw new CapyError("invalid_request", ids.length > 1 ? "\u8FD9\u4E2A Capy \u8D26\u53F7\u6709\u591A\u4E2A\u7EC4\u7EC7\uFF0C\u8BF7\u5728\u767B\u5F55\u51ED\u636E\u91CC\u660E\u786E\u6307\u5B9A org" : "\u8FD9\u4E2A Capy \u8D26\u53F7\u6CA1\u6709\u7EC4\u7EC7\uFF08org\uFF09\uFF0C\u8BF7\u5148\u5728 Capy \u91CC\u5B8C\u6210\u521D\u59CB\u5316");
     }
     const key = await this.options.app.mintApiKey(jwt, orgId, this.options.apiKeyName ?? "magpie-plugin", signal);
     const uid = String(me.id || credential.userId).trim();
@@ -3870,34 +3995,37 @@ function tryJson(text) {
 }
 function balancedObjects(text) {
   const out = [];
-  for (let start = 0;start < text.length; start += 1) {
-    if (text[start] !== "{")
+  const starts = [];
+  let inString = false;
+  let escaped = false;
+  let steps = 0;
+  const budget = Math.min(1e6, Math.max(1e4, text.length * 2));
+  for (let i = 0;i < text.length; i += 1) {
+    steps += 1;
+    if (steps > budget)
+      break;
+    const ch = text[i];
+    if (inString) {
+      if (escaped)
+        escaped = false;
+      else if (ch === "\\")
+        escaped = true;
+      else if (ch === '"')
+        inString = false;
       continue;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let i = start;i < text.length; i += 1) {
-      const ch = text[i];
-      if (inString) {
-        if (escaped)
-          escaped = false;
-        else if (ch === "\\")
-          escaped = true;
-        else if (ch === '"')
-          inString = false;
+    }
+    if (ch === '"')
+      inString = true;
+    else if (ch === "{")
+      starts.push(i);
+    else if (ch === "}") {
+      const start = starts.pop();
+      if (start === undefined)
         continue;
-      }
-      if (ch === '"')
-        inString = true;
-      else if (ch === "{")
-        depth += 1;
-      else if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          out.push(text.slice(start, i + 1));
-          start = i;
+      if (starts.length === 0) {
+        out.push(text.slice(start, i + 1));
+        if (out.length >= 32)
           break;
-        }
       }
     }
   }
@@ -3912,8 +4040,10 @@ class UsageUseCase {
   constructor(options) {
     this.options = options;
   }
-  async load(apiKey, signal) {
-    const key = `usage:${apiKey.slice(-16)}`;
+  async load(apiKey, signal, accountKey2) {
+    if (signal?.aborted)
+      throw new DOMException("Aborted", "AbortError");
+    const key = `usage:${accountKey2 ?? apiKey.slice(-16)}`;
     const hit = this.options.cache?.get(key);
     if (hit)
       return hit;
@@ -3926,12 +4056,11 @@ class UsageUseCase {
       this.options.cache?.set(key, snapshot, this.options.cacheTtlMs ?? DEFAULT_TTL_MS2);
       return snapshot;
     } catch (error) {
+      if (isAbort(error) || signal?.aborted)
+        throw error;
       if (isAuthError(error))
         throw error;
-      return {
-        windows: [],
-        error: error instanceof Error ? error.message : String(error)
-      };
+      return { windows: [], error: errorText(error) };
     }
   }
 }
@@ -4129,6 +4258,15 @@ function parseTool(value) {
     }
   };
 }
+var JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+var SSE_HEADERS = {
+  "content-type": "text/event-stream; charset=utf-8",
+  "cache-control": "no-cache",
+  connection: "keep-alive"
+};
+var SSE_DONE = `data: [DONE]
+
+`;
 function encodeChunk(meta, delta, finishReason = null) {
   return `data: ${JSON.stringify({
     id: meta.id,
@@ -4140,15 +4278,12 @@ function encodeChunk(meta, delta, finishReason = null) {
 
 `;
 }
-function encodeContentDelta(meta, text) {
-  return encodeChunk(meta, { content: text });
-}
-function encodeToolCallCompletion(id, model, created, calls) {
+function encodeToolCallCompletion(meta, calls) {
   return new Response(JSON.stringify({
-    id,
+    id: meta.id,
     object: "chat.completion",
-    created,
-    model,
+    created: meta.created,
+    model: meta.model,
     choices: [{
       index: 0,
       message: {
@@ -4162,7 +4297,7 @@ function encodeToolCallCompletion(id, model, created, calls) {
       },
       finish_reason: "tool_calls"
     }]
-  }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+  }), { status: 200, headers: JSON_HEADERS });
 }
 function encodeToolCallStream(meta, calls) {
   const body = [
@@ -4178,14 +4313,7 @@ function encodeToolCallStream(meta, calls) {
     encodeChunk(meta, {}, "tool_calls"),
     SSE_DONE
   ].join("");
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive"
-    }
-  });
+  return new Response(body, { status: 200, headers: SSE_HEADERS });
 }
 function encodeCompletion(id, model, created, text) {
   return new Response(JSON.stringify({
@@ -4199,14 +4327,14 @@ function encodeCompletion(id, model, created, text) {
       finish_reason: "stop"
     }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-  }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+  }), { status: 200, headers: JSON_HEADERS });
 }
 function encodeErrorResponse(error) {
   const body = toOpenAiError(error);
   return new Response(JSON.stringify(body), {
     status: body.error.status,
     headers: {
-      "content-type": "application/json; charset=utf-8",
+      ...JSON_HEADERS,
       ...body.error.status === 401 ? { "x-magpie-sign-in": "expired" } : {}
     }
   });
@@ -4218,9 +4346,6 @@ data: [DONE]
 
 `;
 }
-var SSE_DONE = `data: [DONE]
-
-`;
 function encodeModelList(models, provider) {
   return new Response(JSON.stringify({
     object: "list",
@@ -4231,51 +4356,45 @@ function encodeModelList(models, provider) {
       owned_by: provider,
       name: model.name
     }))
-  }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+  }), { status: 200, headers: JSON_HEADERS });
 }
 function encodeChatStream(events, meta) {
   const encoder = new TextEncoder;
   const stream = new ReadableStream({
     async start(controller) {
       const push = (text) => controller.enqueue(encoder.encode(text));
+      const finish = () => {
+        push(encodeChunk(meta, {}, "stop"));
+        push(SSE_DONE);
+        controller.close();
+      };
       push(encodeChunk(meta, { role: "assistant", content: "" }));
       let emitted = false;
       try {
         for await (const event of events) {
           if (event.type === "delta") {
             emitted = true;
-            push(encodeContentDelta(meta, event.text));
+            push(encodeChunk(meta, { content: event.text }));
           } else if (event.type === "error") {
             push(encodeSseError(event.error));
             controller.close();
             return;
           } else if (event.type === "final") {
             if (!emitted && event.text)
-              push(encodeContentDelta(meta, event.text));
+              push(encodeChunk(meta, { content: event.text }));
           } else if (event.type === "done") {
-            push(encodeChunk(meta, {}, "stop"));
-            push(SSE_DONE);
-            controller.close();
+            finish();
             return;
           }
         }
-        push(encodeChunk(meta, {}, "stop"));
-        push(SSE_DONE);
-        controller.close();
+        finish();
       } catch (error) {
         push(encodeSseError(error));
         controller.close();
       }
     }
   });
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive"
-    }
-  });
+  return new Response(stream, { status: 200, headers: SSE_HEADERS });
 }
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -4283,68 +4402,40 @@ function isRecord(value) {
 function invalid(message) {
   return new CapyError("invalid_request", message);
 }
+async function collectText(events) {
+  let text = "";
+  for await (const event of events) {
+    if (event.type === "delta")
+      text += event.text;
+    else if (event.type === "final" && !text)
+      text = event.text;
+    else if (event.type === "error")
+      throw event.error;
+  }
+  return text;
+}
+async function* textEvents(text) {
+  if (text)
+    yield { type: "delta", text };
+  yield { type: "done" };
+}
 
 // src/entry/plugin.ts
 var DEFAULT_PROVIDER_ID = "capy";
-var SDK = "@ai-sdk/openai-compatible";
+var SDK2 = "@ai-sdk/openai-compatible";
 var MAX_CONCURRENCY = 2;
 var REFRESH_LEAD_MS = 24 * 3600000;
-function toMagpieModel(model, providerId, toolsEnabled) {
-  const variants = model.reasoningModes.length > 0 ? Object.fromEntries(model.reasoningModes.map((mode) => [mode, {}])) : undefined;
-  return {
-    id: model.id,
-    providerID: providerId,
-    name: isAdsModel(model.id) ? `${model.name} \xB7 US/CA/UK/AU/NZ/IE` : model.name,
-    ...isAdsModel(model.id) ? { description: "Free with ads \u2014 only US / CA / UK / AU / NZ / IE egress IP" } : {},
-    free: model.free,
-    tool_call: toolsEnabled,
-    attachment: true,
-    api: { id: model.id, url: CAPY_PUBLIC, npm: SDK },
-    status: "active",
-    headers: {},
-    options: {},
-    limit: {},
-    modalities: { input: ["text", "image"], output: ["text"] },
-    capabilities: {
-      temperature: false,
-      reasoning: model.reasoningModes.length > 0,
-      attachment: true,
-      toolcall: toolsEnabled,
-      input: { text: true, image: true, audio: false, video: false, pdf: true },
-      output: { text: true, image: false, audio: false, video: false, pdf: false },
-      interleaved: false
-    },
-    ...variants ? { variants } : {}
-  };
-}
-function modelMap(models, providerId, toolsEnabled) {
-  return Object.fromEntries(freeFirst(models).map((model) => [model.id, toMagpieModel(model, providerId, toolsEnabled)]));
-}
-function staticModels(providerId, toolsEnabled) {
-  const models = freeFirst(mergeCatalog(STATIC_CATALOG, EXTRA_FREE_MODELS)).map((raw) => describeModel(raw, { toolsEnabled }));
-  return modelMap(models, providerId, toolsEnabled);
-}
-async function readJsonBody(input, init) {
-  if (typeof init.body === "string")
-    return JSON.parse(init.body);
-  if (init.body instanceof Uint8Array)
-    return JSON.parse(new TextDecoder().decode(init.body));
-  if (init.body)
-    return JSON.parse(await new Response(init.body).text());
-  if (input instanceof Request)
-    return JSON.parse(await input.text());
-  return {};
-}
 function loginErrorText(error) {
   if (error instanceof CapyError)
     return error.message;
   return error instanceof Error ? error.message : String(error);
 }
-async function CapyNextPlugin(_ctx = {}, options = {}) {
+async function CapyPlugin(_ctx = {}, options = {}) {
   const providerId = String(options.providerId || process.env.MAGPIE_CAPY_PROVIDER_ID || DEFAULT_PROVIDER_ID).trim();
   const toolsEnabled = options.toolsEnabled !== false;
   const configuredVariant = String(options.promptVariant ?? process.env.MAGPIE_CAPY_PROMPT_VARIANT ?? "auto").trim().toLowerCase();
-  let minimalUnsupported = configuredVariant === "default" || configuredVariant === "off";
+  const minimalUnsupported = new Set;
+  const minimalAllowed = configuredVariant !== "default" && configuredVariant !== "off";
   const proxyUrl = resolveProxyUrl({
     ...options.proxy === undefined ? {} : { proxy: options.proxy }
   });
@@ -4381,8 +4472,8 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
   const initialModels = staticModels(providerId, toolsEnabled);
   async function modelsFor(session) {
     try {
-      const snapshot = await catalog.load(session.accessToken);
-      return modelMap(snapshot.models, providerId, toolsEnabled);
+      const snapshot = await catalog.load(session.accessToken, undefined, accountKey(session));
+      return modelMap(snapshot.models, providerId);
     } catch (error) {
       if (error instanceof CapyError && error.kind === "sign_in_required")
         throw error;
@@ -4392,12 +4483,42 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
   async function complete(credential) {
     return authRecordOf(await login.complete(credential));
   }
+  function oauthMethod(options2) {
+    return {
+      type: "oauth",
+      label: options2.label,
+      async authorize() {
+        const controller = new AbortController;
+        const probe = options2.start(controller.signal).then((session) => authRecordOf(session));
+        probe.catch(() => {});
+        return {
+          url: options2.url,
+          opened: true,
+          method: "auto",
+          instructions: options2.instructions,
+          close: () => controller.abort(),
+          async callback(_value, callbackOptions = {}) {
+            const onAbort = () => controller.abort();
+            callbackOptions.signal?.addEventListener("abort", onAbort, { once: true });
+            try {
+              return await probe;
+            } catch (error) {
+              return { type: "failed", error: loginErrorText(error) };
+            } finally {
+              callbackOptions.signal?.removeEventListener("abort", onAbort);
+              controller.abort();
+            }
+          }
+        };
+      }
+    };
+  }
   return {
     config: (cfg) => {
       const providers = cfg.provider ??= {};
       providers[providerId] ??= {
         name: "Capy",
-        npm: SDK,
+        npm: SDK2,
         api: CAPY_PUBLIC,
         models: initialModels,
         searches: false
@@ -4408,55 +4529,18 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
       maxConcurrency: MAX_CONCURRENCY,
       refreshLead: REFRESH_LEAD_MS,
       methods: [
-        {
-          type: "oauth",
+        oauthMethod({
           label: "\u4ECE\u672C\u673A Capy \u5BA2\u6237\u7AEF\u5BFC\u5165\uFF08\u53EA\u767B\u5F55\uFF0C\u4E0D\u9700\u8981\u8FD0\u884C\u684C\u9762\u7AEF\uFF09",
-          async authorize() {
-            const probe = login.login("local").then((session) => authRecordOf(session));
-            probe.catch(() => {});
-            return {
-              url: "https://capy.ai",
-              opened: true,
-              method: "auto",
-              instructions: "\u6B63\u5728\u8BFB\u53D6\u672C\u673A Capy \u767B\u5F55\u6001\uFF08\u53EA\u8BFB\u767B\u5F55\u51ED\u636E\uFF0C\u4E0D\u9700\u8981\u542F\u52A8 Capy \u684C\u9762\u7AEF\uFF09\u2026",
-              async callback() {
-                try {
-                  return await probe;
-                } catch (error) {
-                  return { type: "failed", error: loginErrorText(error) };
-                }
-              }
-            };
-          }
-        },
-        {
-          type: "oauth",
+          url: CAPY_ORIGIN,
+          instructions: "\u6B63\u5728\u8BFB\u53D6\u672C\u673A Capy \u767B\u5F55\u6001\uFF08\u53EA\u8BFB\u767B\u5F55\u51ED\u636E\uFF0C\u4E0D\u9700\u8981\u542F\u52A8 Capy \u684C\u9762\u7AEF\uFF09\u2026",
+          start: (signal) => login.login("local", signal)
+        }),
+        oauthMethod({
           label: "\u6D4F\u89C8\u5668\u767B\u5F55\uFF08Google / GitHub / Passkey / \u90AE\u7BB1\uFF09",
-          async authorize() {
-            const controller = new AbortController;
-            const probe = login.login("browser", controller.signal).then((session) => authRecordOf(session));
-            probe.catch(() => {});
-            return {
-              url: "https://capy.ai/sign-in",
-              opened: true,
-              method: "auto",
-              instructions: "\u5DF2\u6253\u5F00 Capy \u5B98\u65B9\u767B\u5F55\u9875\u3002\u7528 Google\u3001GitHub\u3001Passkey \u6216\u90AE\u7BB1\u767B\u5F55\uFF1B" + "\u767B\u5F55\u6210\u529F\u540E\u4F1A\u81EA\u52A8\u8BFB\u53D6\u767B\u5F55\u6001\uFF0C\u4E0D\u9700\u8981\u590D\u5236\u4EFB\u4F55\u4E1C\u897F\u3002",
-              close: () => controller.abort(),
-              async callback(_value, callbackOptions = {}) {
-                const onAbort = () => controller.abort();
-                callbackOptions.signal?.addEventListener("abort", onAbort, { once: true });
-                try {
-                  return await probe;
-                } catch (error) {
-                  return { type: "failed", error: loginErrorText(error) };
-                } finally {
-                  callbackOptions.signal?.removeEventListener("abort", onAbort);
-                  controller.abort();
-                }
-              }
-            };
-          }
-        }
+          url: `${CAPY_ORIGIN}/sign-in`,
+          instructions: "\u5DF2\u6253\u5F00 Capy \u5B98\u65B9\u767B\u5F55\u9875\u3002\u7528 Google\u3001GitHub\u3001Passkey \u6216\u90AE\u7BB1\u767B\u5F55\uFF1B" + "\u767B\u5F55\u6210\u529F\u540E\u4F1A\u81EA\u52A8\u8BFB\u53D6\u767B\u5F55\u6001\uFF0C\u4E0D\u9700\u8981\u590D\u5236\u4EFB\u4F55\u4E1C\u897F\u3002",
+          start: (signal) => login.login("browser", signal)
+        })
       ],
       async refresh(auth) {
         let session;
@@ -4467,7 +4551,7 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
         }
         try {
           await publicApi.listModels(session.accessToken);
-          return { access: session.accessToken, expires: Date.now() + 7 * 24 * 3600000 };
+          return { access: session.accessToken, expires: Date.now() + SESSION_TTL_MS };
         } catch (error) {
           if (!(error instanceof CapyError) || error.kind !== "sign_in_required")
             return;
@@ -4483,7 +4567,7 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
           });
           return {
             access: typeof renewed.access === "string" ? renewed.access : "",
-            expires: typeof renewed.expires === "number" ? renewed.expires : Date.now() + 7 * 24 * 3600000
+            expires: typeof renewed.expires === "number" ? renewed.expires : Date.now() + SESSION_TTL_MS
           };
         } catch {
           throw Object.assign(new Error("Capy \u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55"), { signIn: "expired" });
@@ -4522,9 +4606,9 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
                 return encodeErrorResponse(new CapyError("invalid_request", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5 JSON"));
               }
               const requestBody = parseChatRequest(body);
-              const snapshot = await catalog.load(session.accessToken, signal);
-              const modelId = resolveModelId(requestBody.model, snapshot.models);
-              const model = snapshot.models.find((item) => item.id === modelId);
+              const snapshot = await catalog.load(session.accessToken, signal, accountKey(session));
+              const model = resolveModel(requestBody.model, snapshot.models);
+              const modelId = model.id;
               const reasoningMode = reasoningModeOf(requestBody, model);
               const prepared = await collectAttachments(requestBody.messages, {
                 fetchImpl,
@@ -4548,9 +4632,9 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
                   activeThreadId = thread.id;
                 },
                 onVariantFallback: () => {
-                  minimalUnsupported = true;
+                  minimalUnsupported.add(accountKey(session));
                 },
-                ...minimalUnsupported ? {} : { promptVariant: "minimal" }
+                ...minimalAllowed && !minimalUnsupported.has(accountKey(session)) ? { promptVariant: "minimal" } : {}
               });
               const meta = {
                 id: `chatcmpl-${ids.ulid()}`,
@@ -4559,7 +4643,7 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
               };
               const wantsTools = toolsEnabled && (requestBody.tools?.length ?? 0) > 0;
               if (wantsTools) {
-                const text = await textOf(events);
+                const text = await collectText(events);
                 const parsed = text ? tools.parse(text) : null;
                 if (parsed) {
                   const calls = parsed.calls.map((call) => ({
@@ -4567,13 +4651,13 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
                     name: call.name,
                     arguments: call.arguments
                   }));
-                  return requestBody.stream ? encodeToolCallStream(meta, calls) : encodeToolCallCompletion(meta.id, meta.model, meta.created, calls);
+                  return requestBody.stream ? encodeToolCallStream(meta, calls) : encodeToolCallCompletion(meta, calls);
                 }
                 return requestBody.stream ? encodeChatStream(textEvents(text), meta) : encodeCompletion(meta.id, meta.model, meta.created, text);
               }
               if (requestBody.stream)
                 return encodeChatStream(events, meta);
-              return encodeCompletion(meta.id, meta.model, meta.created, await textOf(events));
+              return encodeCompletion(meta.id, meta.model, meta.created, await collectText(events));
             } catch (error) {
               return encodeErrorResponse(error);
             }
@@ -4588,7 +4672,7 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
           return { error: "\u672A\u767B\u5F55", windows: [] };
         }
         try {
-          const snapshot = await usage.load(session.accessToken);
+          const snapshot = await usage.load(session.accessToken, undefined, accountKey(session));
           let deviceWindow = { connected: false, name: "" };
           try {
             const info = await device.ensure(session);
@@ -4617,23 +4701,6 @@ async function CapyNextPlugin(_ctx = {}, options = {}) {
     }
   };
 }
-async function* textEvents(text) {
-  if (text)
-    yield { type: "delta", text };
-  yield { type: "done" };
-}
-async function textOf(events) {
-  let text = "";
-  for await (const event of events) {
-    if (event.type === "delta")
-      text += event.text;
-    else if (event.type === "final" && !text)
-      text = event.text;
-    else if (event.type === "error")
-      throw event.error;
-  }
-  return text;
-}
 export {
-  CapyNextPlugin as default
+  CapyPlugin as default
 };

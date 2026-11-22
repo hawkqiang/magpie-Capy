@@ -12,7 +12,7 @@ Accepted
 ## 决策
 
 - `ModelDescriptor` 是数据；`CapabilityRegistry` 把 descriptor → OpenAI capabilities。
-- `ModelPolicy` 可组合：free-first、vendor allowlist、context budget、未来 cost/latency。
+- `ModelPolicy` 可组合：free-first、能力 override、context budget、未来 cost/latency。
 - `ToolBridge` 是 port：
   - 当前 `PromptToolBridge`（提示词 + JSON 解析）
   - 未来 `NativeToolBridge`（不改 application）

@@ -71,7 +71,7 @@
 | `MAX_PROMPT_CHARS=160_000` + 自动裁剪 | 把插件自己的常量当成 Capy 限制，255k 正常对话被误杀 | 删除；`buildPrompt` 原样透传 |
 | `MAX_ATTACHMENT_BYTES=20MB` | OpenAPI 实际允许 250MB | spec 改为 `262,144,000` |
 | `MAX_ATTACHMENTS=8` / `MAX_TOTAL_BYTES=60MB` | 没有 API 证据；来自别处常量/猜测 | spec 删除；不额外发明限制 |
-| `DEFAULT_MODEL_ID="particle/particle-1"` | 不是 Capy 的默认模型；`/models.default` 才是 | 删除常量；`CatalogSnapshot.default` 保留上游 `{modelId,source,skipped}` |
+| `DEFAULT_MODEL_ID="particle/particle-1"` | 不是 Capy 的默认模型；`/models.default` 才是 | 删除常量；不硬编码默认模型 |
 | `defaultModelOf()` 回退到第一个模型 | 静默发明默认模型 | 删除 |
 | `resolveModelId()` 无 model 时回退第一个 | 同上 | 改为缺少 model 直接 `invalid_request`；调用方应省略 `modelId` 让 Capy 走默认链 |
 | `clientId` 缺失时 `randomUUID()` | 伪造 Clerk client 身份 | 改为空字符串；只接受登录适配器提供的真实 `__client` id |

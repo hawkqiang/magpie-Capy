@@ -1,3 +1,5 @@
+export const SESSION_TTL_MS = 7 * 24 * 3600_000;
+
 export type LoginSource = "local" | "browser" | "refresh";
 
 export interface ClerkSession {

@@ -1,5 +1,5 @@
 import type { ChatEvent } from "../domain/chat.ts";
-import { CapyError } from "../domain/errors.ts";
+import { mapCapyCode } from "../domain/errors.ts";
 import type { SseFrame } from "../protocol/sse.ts";
 
 interface AssistantPayload {
@@ -111,25 +111,10 @@ export class PublicSseNormalizer {
       ? payload.message
       : "Capy 原生流返回错误";
     this.errored = true;
-    return [{ type: "error", error: mapStreamError(code, message) }];
+    return [{ type: "error", error: mapCapyCode(code, message) }];
   }
 }
 
-function mapStreamError(code: string, message: string): CapyError {
-  if (code === "region_unsupported") {
-    return new CapyError("region_unsupported", message, { detail: code });
-  }
-  if (code === "unauthorized") {
-    return new CapyError("sign_in_required", message, { detail: code });
-  }
-  if (code === "forbidden") {
-    return new CapyError("upstream_error", message, { status: 403, detail: code });
-  }
-  if (code === "rate_limited") {
-    return new CapyError("rate_limited", message, { detail: code });
-  }
-  return new CapyError("upstream_error", message, { detail: code });
-}
 
 function parseJson<T>(value: string): T | null {
   if (!value) return null;

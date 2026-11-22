@@ -19,16 +19,12 @@ export interface Balance {
   readonly currency?: string;
   readonly remainingDollars?: number | null;
   readonly unlimited?: boolean;
-  readonly periodStart?: string | null;
   readonly periodEnd?: string | null;
 }
 
 export interface UsageTotals {
-  readonly totals?: { readonly totalDollars?: number };
   readonly tokens?: {
     readonly inputTokens?: number;
     readonly outputTokens?: number;
-    readonly cacheReadTokens?: number;
-    readonly cacheWriteTokens?: number;
   };
 }

@@ -1,5 +1,6 @@
 import type { ClerkSession } from "../../domain/account.ts";
 import { CapyError } from "../../domain/errors.ts";
+import { decodeJwtPayload } from "../platform/jwt.ts";
 import { requestJson } from "../platform/http.ts";
 import { CAPY_FAPI, CAPY_ORIGIN } from "./endpoints.ts";
 
@@ -46,18 +47,5 @@ export class ClerkClient {
       });
     }
     return jwt;
-  }
-}
-
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  const part = token.split(".")[1];
-  if (!part) return null;
-  try {
-    const value: unknown = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
-    return value && typeof value === "object" && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
   }
 }

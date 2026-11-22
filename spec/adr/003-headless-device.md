@@ -12,7 +12,7 @@ Capy 的免费模型线程绑在 device 上；早期实现要求启动 Capy 桌�
 
 ## 决策
 
-- 首次使用自动 `POST /app/devices/code` → approve → poll，注册 `magpie-headless`。
+- 首次使用自动 `POST /app/devices/code` → approve → poll，注册以主机名命名的设备（如 `baijiu`）。
 - device token 存用户目录：Windows DPAPI；macOS/Linux 0600 文件；连接 device tunnel。
 - 设备登记上报 `win32 | darwin | linux`；只要宿主有 WebSocket 就能运行，不绑定 Windows。
 - 连接失败先复用同一 token 重连；仅服务端明确拒绝 token 时才重新配对（防重复注册）。
@@ -31,4 +31,4 @@ Capy 的免费模型线程绑在 device 上；早期实现要求启动 Capy 桌�
 
 - 云端线程：需要 credits，免费模型不可用。
 - 要求桌面端：旧行为，已放弃。
-- 完整 machine server：工程量大，不是本次目标。
+- 浏览器/computer 的完整 machine server：工程量大，不是本次目标。

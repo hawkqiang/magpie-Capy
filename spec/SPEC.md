@@ -8,7 +8,7 @@
 把 Capy（capy.ai）作为 Magpie 的一个 provider 接进来：
 
 - **登录**：浏览器登录 / 从本机 Capy 客户端导入登录态（只读，不要求 Capy 运行）
-- **运行时**：自动注册并维护一台 `magpie-headless` 设备，走 Capy device tunnel
+- **运行时**：自动注册并维护一台以主机名命名的无头设备（如 `baijiu`），走 Capy device tunnel
 - **对话**：OpenAI 兼容 `/chat/completions`，原生 SSE，边生成边转发
 - **模型**：64 个目录条目，3 个免费模型
 - **附件**：图片/文件走 Capy 官方文件通道
@@ -30,7 +30,7 @@
 
 ### 非目标
 
-- 不实现 Capy 桌面端的完整 machine server（终端/浏览器/写文件/Drive 全量 RPC）。
+- machine server 已实现 bash/文件/工作区；浏览器/computer/Drive 全量 RPC 未实现。
 - 不实现原生 OpenAI tools（Capy 没有该通道；只有最佳努力提示词桥）。
 - 不实现 `temperature` / `top_p` / `max_tokens` / `stop` / `response_format`（Capy 无对应字段）。
 - 不提供浏览器 UI；UI 属于 Magpie 主机。
@@ -45,7 +45,7 @@
 | Control plane | 登录、账号、设备配对、模型目录、额度 |
 | Data plane | `/chat/completions` 的请求/流式响应 |
 | AccountSession | 一个 Capy 账号的不可变会话视图（API key、Clerk 会话、orgId、clientId） |
-| Headless device | 插件自己维护的 `magpie-headless` 设备；不是 Capy 桌面端 |
+| Headless device | 插件自己维护的主机名设备（如 `baijiu`）；不是 Capy 桌面端 |
 | Device tunnel | `wss://device-tunnel-production.cloud.capy.ai/tunnel` |
 | Machine RPC | 服务端通过 tunnel 发给设备的 HTTP-over-WS 请求（worktree/volume/git…） |
 | Capy App API | `https://api.capy.ai/app/*`，Clerk `azp` JWT |
@@ -56,7 +56,7 @@
 ### 4.1 首次使用（本机已有 Capy 登录）
 
 1. `magpie plugin login capy 1` → 读本机登录态，换 Clerk 会话 + API key。
-2. 首次对话 → 插件自动设备码配对 → `magpie-headless` 上线。
+2. 首次对话 → 插件自动设备码配对 → `baijiu` 上线。
 3. 对话 → 原生 SSE。
 
 ### 4.2 首次使用（只用浏览器）
@@ -130,7 +130,7 @@
 - **FR-4.4 流式输出**：OpenAI `chat.completion.chunk`；`finish_reason:"stop"`；`[DONE]`。
 - **FR-4.5 非流式**：返回完整 `chat.completion`。
 - **FR-4.6 取消**：客户端断开 → `POST /app/.../interrupt`。
-- **FR-4.7 降级**：公共 SSE 不可用 → outline 轮询（仅在必要时）。
+- **FR-4.7 降级**：公共 SSE 失败 → 明确错误；不自动轮询 outline（未实现）。
 - **FR-4.8 思考档位**：`reasoning_effort` → `model.reasoningMode`；不支持则丢弃。
 - **FR-4.9 上下文预算**：不设本地字符上限。Capy 按 token 管理上下文
   （`GET /app/orgs/{org}/jams/{jam}/events/context-usage` →
@@ -143,13 +143,12 @@
 - **FR-5.2 上传**：`POST /api/v1/files` → 预签名 PUT → jam `files[]`。
 - **FR-5.3 限制**：公共 API 规定**单文件最大 250 MB**（`sizeBytes` 上限 262,144,000），
   文件数没有 API 级上限；不额外发明 8 个/60 MB 之类的本地限制。本机/内网 URL 拒绝（SSRF）。
-- **FR-5.4 缓存**：同 API key + 同字节 1h 复用 `fileId`。
 
 ### FR-6 额度
 
 - **FR-6.1 余额**：`/usage/balance` → `余额` 窗口；无余额 `used:100` 让账号沉底。
 - **FR-6.2 Token**：`/usage` → aside 展示。
-- **FR-6.3 设备状态**：无头设备 `connected` → `已连接 · magpie-headless`。
+- **FR-6.3 设备状态**：无头设备 `connected` → `已连接 · <hostname>`。
 - **FR-6.4 不显示本期消费**。
 
 ### FR-7 错误
@@ -174,7 +173,7 @@
 ### FR-10 工具
 
 - 默认开启提示词桥：tools → 提示词 → 解析 `tool_calls` JSON。
-- 模型不配合 → 文本 + warning；`MAGPIE_CAPY_TOOL_SHIM=0` 关闭。
+- 模型不配合 → 文本 + warning；`options.toolsEnabled=false` 关闭。
 - 未来 Capy 若提供原生 tools：实现 `ToolBridge` 适配器，不改 application。
 
 ## 6. 对外 API
@@ -204,7 +203,7 @@ AccountSession {
   accountId, uid, orgId, clientId,
   accessToken,            // capy_…
   clerk: { clientJwt, sessionId },
-  source: "local" | "browser"
+  source: "local" | "browser" | "refresh"
 }
 
 HeadlessCredential {
@@ -212,9 +211,9 @@ HeadlessCredential {
 }
 
 ModelDescriptor {
-  id, name, vendor, free,
+  id, name, free,
   reasoningModes: string[],
-  capabilities: { text, image, attachment, tools }
+  capabilities: { text, image, pdf, attachment, tools }
 }
 
 ChatRequest / ChatEvent / UsageSnapshot / CapyError
@@ -279,7 +278,7 @@ ChatRequest / ChatEvent / UsageSnapshot / CapyError
 ## 11. 未来模型与能力演进
 
 - `ModelDescriptor` + `CapabilityRegistry`：模型能力数据驱动。
-- `ModelPolicy`：free-first / vendor allowlist / context limits，可插拔。
+- `ModelPolicy`：free-first、能力 override、上下文预算；按需扩展。
 - `ToolBridge`：当前 `PromptToolBridge`；未来 `NativeToolBridge` 只替换适配器。
 - `StreamNormalizer`：把不同上游事件（SSE/NDJSON）归一成 `ChatEvent`。
 - 协议版本：`contractVersion` 校验；未知帧忽略；新能力通过 capability 探测。

@@ -58,7 +58,7 @@ POST /app/orgs/{orgId}/api-keys
 
 ```http
 GET /app/orgs/{orgId}/devices
-→ [{ "id": "device_…", "name": "magpie-headless", "connected": true, … }]
+→ [{ "id": "device_…", "name": "baijiu", "connected": true, … }]
 ```
 
 ### 3.4 设备码配对（无头设备）
@@ -81,7 +81,7 @@ POST /app/devices/code
 
 ```http
 POST /app/orgs/{orgId}/devices/code/approve
-{ "userCode": "ABCD-EFGH", "name": "magpie-headless" }
+{ "userCode": "ABCD-EFGH", "name": "baijiu" }
 → { "status": "approved" }
 ```
 
@@ -93,7 +93,7 @@ POST /app/devices/code/poll
   "orgName": "…",
   "enrolled": {
     "orgId": "org_…",
-    "device": { "id": "device_…", "name": "magpie-headless", … },
+    "device": { "id": "device_…", "name": "baijiu", … },
     "token": "capyd_…"
   }
 }
@@ -116,7 +116,7 @@ POST /app/orgs/{orgId}/jams
 }
 → {
   "id": "jam_…",
-  "primaryMachine": { "kind": "device", "machineId": "machine_…", "name": "magpie-headless" },
+  "primaryMachine": { "kind": "device", "machineId": "machine_…", "name": "baijiu" },
   "projectId": null,
   "status": "idle",
   "ask": null
@@ -406,7 +406,7 @@ data: [DONE]
 | 402 / `capy/PaidFeatureUnavailable` | 402 `insufficient_quota` |
 | 403 / `region_unsupported` | 403 `region_unsupported` |
 | 403 / `capy/Forbidden` | 403 `upstream_error` |
-| 429 / `capy/RateLimited` | 429 `rate_limited` + `retry-after` |
+| 429 / `capy/RateLimited` | 429 `rate_limited` |
 | 5xx / 网络 | 503 `upstream_unavailable` |
 | 超时 | 504 `upstream_timeout` |
 | 设备配对失败 | 403 `device_pair_failed` |

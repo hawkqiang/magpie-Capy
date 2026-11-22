@@ -4,7 +4,7 @@ import { buildUsage, money, withDeviceWindow } from "../../src/application/usage
 
 test("buildUsage：无余额 → used=100；不显示本期消费", () => {
   const usage = buildUsage(
-    { totals: { totalDollars: 3 }, tokens: { inputTokens: 10, outputTokens: 2 } },
+    { tokens: { inputTokens: 10, outputTokens: 2 } },
     { remainingDollars: null, unlimited: false },
   );
   expect(usage.windows[0]).toMatchObject({ name: "余额", used: 100 });

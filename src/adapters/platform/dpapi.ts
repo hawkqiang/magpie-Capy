@@ -15,26 +15,22 @@ function powershell(script: string): string {
   ).trim();
 }
 
-export function dpapiUnprotect(blob: Uint8Array): Buffer {
+function dpapiTransform(encoded: string, op: "Protect" | "Unprotect"): string {
   if (process.platform !== "win32") throw new Error("DPAPI 只在 Windows 可用");
-  const encoded = Buffer.from(blob).toString("base64");
   const script = `$ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Security
 $b=[Convert]::FromBase64String('${encoded}')
-$p=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+$p=[System.Security.Cryptography.ProtectedData]::${op}($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
 [Convert]::ToBase64String($p)`;
-  return Buffer.from(powershell(script), "base64");
+  return powershell(script);
+}
+
+export function dpapiUnprotect(blob: Uint8Array): Buffer {
+  return Buffer.from(dpapiTransform(Buffer.from(blob).toString("base64"), "Unprotect"), "base64");
 }
 
 export function dpapiProtect(text: string): string {
-  if (process.platform !== "win32") throw new Error("DPAPI 只在 Windows 可用");
-  const encoded = Buffer.from(text, "utf8").toString("base64");
-  const script = `$ErrorActionPreference='Stop'
-Add-Type -AssemblyName System.Security
-$b=[Convert]::FromBase64String('${encoded}')
-$p=[System.Security.Cryptography.ProtectedData]::Protect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-[Convert]::ToBase64String($p)`;
-  return powershell(script);
+  return dpapiTransform(Buffer.from(text, "utf8").toString("base64"), "Protect");
 }
 
 /** Chromium "v10" + 12-byte nonce + AES-256-GCM ciphertext + 16-byte tag。 */
@@ -56,8 +52,7 @@ export function decryptChromiumAesGcm(ciphertextBase64: string, key: Uint8Array)
 
 export function coerceAesKey(value: unknown): Buffer {
   let key: Buffer | null = null;
-  if (Buffer.isBuffer(value)) key = value;
-  else if (ArrayBuffer.isView(value)) key = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  if (ArrayBuffer.isView(value)) key = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
   else if (value instanceof ArrayBuffer) key = Buffer.from(value);
   else if (typeof value === "string" && /^[0-9a-fA-F]{64}$/u.test(value.trim())) {
     key = Buffer.from(value.trim(), "hex");

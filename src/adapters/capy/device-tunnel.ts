@@ -1,16 +1,16 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import type { AccountSession } from "../../domain/account.ts";
 import { accountKey } from "../../domain/account.ts";
-import { CapyError } from "../../domain/errors.ts";
+import { CapyError, errorText, isAuthError } from "../../domain/errors.ts";
 import type { HeadlessCredential, DeviceRuntimePort } from "../../ports/device-runtime.ts";
-import type { DeviceInfo } from "../../ports/capy-app.ts";
+import type { CapyAppPort, DeviceInfo } from "../../ports/capy-app.ts";
 import type { ClockPort, LoggerPort, SecretStorePort } from "../../ports/platform.ts";
-import type { CapyAppPort } from "../../ports/capy-app.ts";
 import { dpapiProtect, dpapiUnprotect } from "../platform/dpapi.ts";
 import { CONTRACT_VERSION, DEVICE_TUNNEL } from "./endpoints.ts";
 
@@ -120,20 +120,17 @@ interface TunnelFrame {
 
 interface StreamState {
   readonly streamId: number;
-  readonly kind: string;
-  readonly method: string;
   readonly path: string;
   readonly headers: Record<string, string>;
-  body: Buffer;
+  readonly expectedLength: number;
+  readonly chunks: Buffer[];
+  received: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  done: boolean;
 }
 
-function headerValue(headers: Record<string, string>, name: string): string {
-  const wanted = name.toLowerCase();
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === wanted) return String(value);
-  }
-  return "";
-}
+const STREAM_TIMEOUT_MS = 60_000;
+
 
 function encodeDataFrame(streamId: number, body: Buffer): Buffer {
   const frame = Buffer.alloc(4 + body.length);
@@ -214,9 +211,11 @@ async function runBash(params: Record<string, unknown>, cwd: string): Promise<Ma
       resolve(fail("MachineServer.Bash", `Failed to start bash: ${error instanceof Error ? error.message : String(error)}`));
       return;
     }
-    const append = (current: string, chunk: Buffer): string => {
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const append = (current: string, text: string): string => {
       if (current.length >= maxChars) return current;
-      return current + chunk.toString("utf8").slice(0, maxChars - current.length);
+      return current + text.slice(0, maxChars - current.length);
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -228,8 +227,8 @@ async function runBash(params: Record<string, unknown>, cwd: string): Promise<Ma
       }
     }, timeoutSeconds * 1000);
     timer.unref?.();
-    child.stdout?.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
-    child.stderr?.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
+    child.stdout?.on("data", (chunk: Buffer) => { stdout = append(stdout, stdoutDecoder.write(chunk)); });
+    child.stderr?.on("data", (chunk: Buffer) => { stderr = append(stderr, stderrDecoder.write(chunk)); });
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
@@ -240,6 +239,8 @@ async function runBash(params: Record<string, unknown>, cwd: string): Promise<Ma
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      stdout = append(stdout, stdoutDecoder.end());
+      stderr = append(stderr, stderrDecoder.end());
       resolve(ok({
         kind: "bash",
         stdout,
@@ -271,7 +272,7 @@ export async function machineResult(
       created = !fs.existsSync(resolved);
       fs.mkdirSync(resolved, { recursive: true });
     }
-    return ok({ root, created, checkouts: [] });
+    return ok({ root: root ? path.resolve(root) : "", created, checkouts: [] });
   }
   if (handler === "worktree_list") {
     return ok({ kind: "worktree_list", entries: [] });
@@ -339,12 +340,15 @@ export async function machineResult(
         return fail("MachineServer.FileError", "oldString must be non-empty and differ from newString");
       }
       const text = fs.readFileSync(file, "utf8");
-      const count = text.split(oldString).length - 1;
+      const parts = text.split(oldString);
+      const count = parts.length - 1;
       if (count === 0) return fail("MachineServer.FileError", `The text was not found in ${String(params.path)}`);
       if (count > 1 && params.replaceAll !== true) {
         return fail("MachineServer.FileError", `Found ${count} occurrences; provide more context or replaceAll`);
       }
-      const next = params.replaceAll === true ? text.split(oldString).join(newString) : text.replace(oldString, newString);
+      const next = params.replaceAll === true
+        ? parts.join(newString)
+        : `${parts[0] ?? ""}${newString}${parts.slice(1).join(oldString)}`;
       fs.writeFileSync(file, next, "utf8");
       return ok({ kind: "edit", path: file, replacements: count, isError: false });
     } catch (error) {
@@ -500,14 +504,9 @@ class HeadlessDevice {
     this.ready = true;
   }
 
-  private send(frame: Record<string, unknown>): boolean {
-    if (!this.ws || this.ws.readyState !== 1) return false;
-    try {
-      this.ws.send(JSON.stringify(frame));
-      return true;
-    } catch {
-      return false;
-    }
+  private send(frame: Record<string, unknown>): void {
+    if (!this.ws || this.ws.readyState !== 1) return;
+    try { this.ws.send(JSON.stringify(frame)); } catch {}
   }
 
   private sendBinary(bytes: Buffer): void {
@@ -529,10 +528,11 @@ class HeadlessDevice {
     const frame = decodeDataFrame(raw);
     if (!frame) return;
     const stream = this.streams.get(frame.streamId);
-    if (!stream) return;
-    stream.body = Buffer.concat([stream.body, Buffer.from(frame.body)]);
-    const length = Number(headerValue(stream.headers, "content-length") || 0);
-    if (!length || stream.body.length >= length) this.runStream(stream);
+    if (!stream || stream.done) return;
+    const chunk = Buffer.from(frame.body);
+    stream.chunks.push(chunk);
+    stream.received += chunk.length;
+    if (stream.expectedLength > 0 && stream.received >= stream.expectedLength) this.runStream(stream);
   }
 
   private onControl(text: string): void {
@@ -552,15 +552,30 @@ class HeadlessDevice {
     if (type === "open") {
       const streamId = Number(frame.streamId);
       if (!Number.isInteger(streamId)) return;
+      const headers: Record<string, string> = {};
+      if (frame.headers && typeof frame.headers === "object") {
+        for (const [key, value] of Object.entries(frame.headers as Record<string, unknown>)) {
+          headers[key.toLowerCase()] = String(value);
+        }
+      }
+      const expectedLength = Number(headers["content-length"] ?? 0);
+      const timer = setTimeout(() => {
+        const stream = this.streams.get(streamId);
+        if (!stream || stream.done) return;
+        stream.done = true;
+        this.streams.delete(streamId);
+        this.respond(streamId, 200, fail("MachineServer.Timeout", "machine RPC stream timed out"));
+      }, STREAM_TIMEOUT_MS);
+      timer.unref?.();
       this.streams.set(streamId, {
         streamId,
-        kind: String(frame.kind ?? "invoke"),
-        method: String(frame.method ?? "POST"),
         path: String(frame.path ?? ""),
-        headers: (frame.headers && typeof frame.headers === "object"
-          ? frame.headers as Record<string, string>
-          : {}),
-        body: Buffer.alloc(0),
+        headers,
+        expectedLength: Number.isFinite(expectedLength) && expectedLength > 0 ? expectedLength : 0,
+        chunks: [],
+        received: 0,
+        timer,
+        done: false,
       });
       return;
     }
@@ -572,18 +587,22 @@ class HeadlessDevice {
   }
 
   private runStream(stream: StreamState): void {
+    if (stream.done) return;
+    stream.done = true;
+    if (stream.timer) clearTimeout(stream.timer);
+    stream.timer = null;
     void this.handleStream(stream).catch((error) => {
-      this.respond(stream.streamId, 200, {
-        status: "failed",
-        error: { code: "MachineServer.Internal", message: errorText(error) },
-      });
+      this.respond(stream.streamId, 200, fail("MachineServer.Internal", errorText(error)));
     });
   }
 
   private async handleStream(stream: StreamState): Promise<void> {
     this.streams.delete(stream.streamId);
     let payload: unknown = null;
-    try { payload = stream.body.length > 0 ? JSON.parse(stream.body.toString("utf8")) : null; } catch {}
+    try {
+      const body = stream.chunks.length > 0 ? Buffer.concat(stream.chunks) : Buffer.alloc(0);
+      payload = body.length > 0 ? JSON.parse(body.toString("utf8")) : null;
+    } catch {}
     const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
     let result: MachineOutcome;
     if (stream.path.startsWith("/v1/git/capture")) {
@@ -595,8 +614,8 @@ class HeadlessDevice {
         : {};
       result = await machineResult(handler, params, this.activeRoot ?? this.worktreeBase);
       if (handler === "worktree_ensure" && result.status === "succeeded") {
-        const root = String(params.root ?? "");
-        if (root) this.activeRoot = root;
+        const root = (result.result as { root?: unknown } | null)?.root;
+        if (typeof root === "string" && root) this.activeRoot = root;
       }
     } else {
       result = fail("MachineServer.Unavailable", `未实现的路径 ${stream.path}`);
@@ -640,7 +659,6 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
   private readonly logger: LoggerPort | undefined;
   private readonly deviceName: string;
   private readonly devices = new Map<string, HeadlessDevice>();
-  private readonly inflight = new Map<string, Promise<DeviceInfo>>();
 
   constructor(options: {
     readonly app: CapyAppPort;
@@ -657,16 +675,7 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
   }
 
   async ensure(session: AccountSession, signal?: AbortSignal): Promise<DeviceInfo> {
-    const key = accountKey(session);
-    const hit = this.inflight.get(key);
-    if (hit) return await hit;
-    const task = this.ensureOne(session, signal);
-    this.inflight.set(key, task);
-    try {
-      return await task;
-    } finally {
-      this.inflight.delete(key);
-    }
+    return await this.ensureOne(session, signal);
   }
 
   close(): void {
@@ -680,7 +689,7 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
     if (existing) {
       try {
         await existing.ensure();
-        return this.infoOf(existing);
+        return existing.info;
       } catch {
         existing.close();
         this.devices.delete(key);
@@ -721,9 +730,7 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
     return { id: credential.deviceId, name: credential.name, connected: true };
   }
 
-  private infoOf(device: HeadlessDevice): DeviceInfo {
-    return device.info;
-  }
+
 
   private async connect(credential: HeadlessCredential, signal?: AbortSignal): Promise<HeadlessDevice> {
     let lastError: unknown = null;
@@ -761,13 +768,15 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
       const hint = start.verificationUrl ? `；可在浏览器打开 ${start.verificationUrl} 手动批准` : "";
       throw new CapyError("device_pair_failed", `Capy 设备码自动批准失败：${errorText(error)}${hint}`);
     }
-    for (let i = 0; i < 10; i += 1) {
+    let intervalMs = start.pollIntervalSeconds * 1000;
+    const deadline = this.clock.now() + start.expiresInSeconds * 1000;
+    while (this.clock.now() < deadline) {
       let poll;
       try {
         poll = await this.app.pollDeviceCode(jwt, start.deviceCode, signal);
       } catch (error) {
         if ((error as { status?: unknown } | null)?.status === 401) throw error;
-        await this.clock.sleep(start.pollIntervalSeconds * 1000, signal);
+        await this.clock.sleep(intervalMs, signal);
         continue;
       }
       if (poll.status === "approved") {
@@ -783,7 +792,8 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
       if (poll.status === "denied" || poll.status === "expired") {
         throw new CapyError("device_pair_failed", `Capy 设备码配对${poll.status === "denied" ? "被拒绝" : "已过期"}`);
       }
-      await this.clock.sleep(start.pollIntervalSeconds * 1000, signal);
+      if (poll.status === "slow_down") intervalMs = Math.min(10_000, Math.round(intervalMs * 1.5));
+      await this.clock.sleep(intervalMs, signal);
     }
     throw new CapyError("upstream_timeout", "等待 Capy 设备码批准超时");
   }
@@ -794,17 +804,19 @@ export class HeadlessDeviceRuntime implements DeviceRuntimePort {
     deviceId: string,
     signal?: AbortSignal,
   ): Promise<boolean> {
-    const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline) {
-      const devices = await this.app.listDevices(jwt, orgId, signal).catch(() => []);
-      const hit = devices.find((device) => device.id === deviceId);
-      if (hit?.connected) return true;
-      await this.clock.sleep(CONNECT_POLL_MS, signal);
+    const deadline = this.clock.now() + 20_000;
+    let attempt = 0;
+    while (this.clock.now() < deadline) {
+      try {
+        const devices = await this.app.listDevices(jwt, orgId, signal);
+        const hit = devices.find((device) => device.id === deviceId);
+        if (hit?.connected) return true;
+      } catch (error) {
+        if (signal?.aborted || isAuthError(error)) throw error;
+      }
+      attempt += 1;
+      await this.clock.sleep(Math.min(3_000, CONNECT_POLL_MS * (2 ** Math.min(attempt, 4))), signal);
     }
     return false;
   }
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

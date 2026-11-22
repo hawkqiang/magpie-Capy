@@ -24,6 +24,23 @@ export interface FilePart {
 
 export type ContentPart = TextPart | ImagePart | FilePart;
 
+export function isTextPart(part: ContentPart): part is TextPart {
+  return part.type === "text" || part.type === "input_text" || part.type === "output_text";
+}
+
+export function isImagePart(part: ContentPart): part is ImagePart {
+  return part.type === "image_url" || part.type === "input_image" || part.type === "image";
+}
+
+export function isFilePart(part: ContentPart): part is FilePart {
+  return part.type === "file" || part.type === "input_file";
+}
+
+export function partMarker(part: ImagePart | FilePart): string {
+  if (isImagePart(part)) return `[图片: ${part.name ?? "image"}]`;
+  return `[附件: ${part.name ?? "file"}]`;
+}
+
 export interface ToolCall {
   readonly id: string;
   readonly name: string;
@@ -88,14 +105,8 @@ function textOfContent(content: string | readonly ContentPart[]): string {
   if (typeof content === "string") return content;
   const parts: string[] = [];
   for (const part of content) {
-    if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
-      parts.push(part.text);
-    } else if (part.type === "image_url" || part.type === "input_image" || part.type === "image") {
-      parts.push(`[图片: ${part.name ?? "image"}]`);
-    } else {
-      const name = "name" in part && typeof part.name === "string" ? part.name : "file";
-      parts.push(`[附件: ${name}]`);
-    }
+    if (isTextPart(part)) parts.push(part.text);
+    else parts.push(partMarker(part));
   }
   return parts.join("\n");
 }

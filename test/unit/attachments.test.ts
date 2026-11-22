@@ -40,3 +40,19 @@ test("attachments：本机/内网 URL 拒绝（SSRF）", async () => {
     content: [{ type: "image_url", url: "http://127.0.0.1/secret.png" }],
   }], { fetchImpl: fetch })).rejects.toMatchObject({ kind: "invalid_request" });
 });
+
+test("attachments：远程 302 到内网地址被拒绝（逐跳校验）", async () => {
+  let calls = 0;
+  const fakeFetch = (async () => {
+    calls += 1;
+    return new Response(null, {
+      status: 302,
+      headers: { location: "http://127.0.0.1/secret.png" },
+    });
+  }) as unknown as typeof fetch;
+  await expect(collectAttachments([{
+    role: "user",
+    content: [{ type: "image_url", url: "https://example.com/a.png" }],
+  }], { fetchImpl: fakeFetch })).rejects.toMatchObject({ kind: "invalid_request" });
+  expect(calls).toBe(1);
+});

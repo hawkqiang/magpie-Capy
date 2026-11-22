@@ -1,6 +1,6 @@
 {
   "name": "magpie-capy",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Capy provider plugin for magpie: headless device, native SSE, image/PDF attachments, zero runtime dependencies.",
   "type": "module",
   "main": "dist/index.mjs",

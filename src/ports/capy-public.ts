@@ -1,4 +1,4 @@
-import type { ModelDefaultInfo, RawModel } from "../domain/model.ts";
+import type { RawModel } from "../domain/model.ts";
 import type { Balance, UsageTotals } from "../domain/usage.ts";
 
 export interface UpstreamSseFrame {
@@ -23,8 +23,6 @@ export interface UploadedFile {
 export interface CapyPublicPort {
   listModels(apiKey: string, signal?: AbortSignal): Promise<{
     readonly items: readonly RawModel[];
-    /** Capy 的默认模型链；可能包含 skipped 的 ads 模型。 */
-    readonly default?: ModelDefaultInfo;
   }>;
   streamThread(
     apiKey: string,

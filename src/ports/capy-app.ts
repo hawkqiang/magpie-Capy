@@ -1,5 +1,4 @@
 import type { ClerkSession } from "../domain/account.ts";
-import type { ModelDefaultInfo } from "../domain/model.ts";
 
 export interface AccountProfile {
   readonly id: string;
@@ -70,10 +69,7 @@ export interface JamAsk {
 
 export interface JamCreated {
   readonly id: string;
-  readonly primaryMachine: { readonly kind: "device" | "cloud"; readonly name?: string };
-  readonly ask?: JamAsk | null;
-  /** 请求未指定 model 时，Capy 返回的默认链结果。 */
-  readonly modelDefault?: ModelDefaultInfo;
+  readonly primaryMachine: { readonly kind: "device" | "cloud" };
 }
 
 export interface JamDetail {
@@ -85,11 +81,9 @@ export interface JamDetail {
 export interface JamEvent {
   readonly id: string;
   readonly kind: string;
-  readonly state?: string;
   readonly payload?: {
     readonly code?: string;
     readonly message?: string;
-    readonly retryable?: boolean;
   };
 }
 

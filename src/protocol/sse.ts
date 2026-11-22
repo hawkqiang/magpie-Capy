@@ -2,12 +2,11 @@ export interface SseFrame {
   readonly event: string;
   readonly data: string;
   readonly id?: string;
-  readonly retry?: number;
 }
 
 /**
  * 增量 SSE 解析器。
- * 只处理 `event:` / `data:` / `id:` / `retry:`；注释与未知字段忽略。
+ * 只处理 `event:` / `data:` / `id:`；注释、retry、id-only 帧忽略。
  */
 export class SseParser {
   private buffer = "";
@@ -38,7 +37,6 @@ function parseFrame(raw: string): SseFrame | null {
   let event = "";
   let data = "";
   let id = "";
-  let retry: number | undefined;
 
   for (const line of raw.split(/\r?\n/u)) {
     if (!line || line.startsWith(":")) continue;
@@ -48,19 +46,10 @@ function parseFrame(raw: string): SseFrame | null {
     if (field === "event") event = value;
     else if (field === "data") data = data ? `${data}\n${value}` : value;
     else if (field === "id") id = value;
-    else if (field === "retry") {
-      const n = Number(value);
-      if (Number.isFinite(n) && n >= 0) retry = n;
-    }
   }
 
-  if (!event && !data && retry === undefined) return null;
-  return {
-    event,
-    data,
-    ...(id ? { id } : {}),
-    ...(retry === undefined ? {} : { retry }),
-  };
+  if (!event && !data) return null;
+  return { event, data, ...(id ? { id } : {}) };
 }
 
 /** 把字节流解成 SSE 帧。 */

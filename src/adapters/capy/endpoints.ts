@@ -20,11 +20,8 @@ function appHeaders(jwt: string, extra: Record<string, string> = {}): Record<str
   };
 }
 
-export function clientHeaders(jwt: string, clientId: string, extra: Record<string, string> = {}): Record<string, string> {
-  return appHeaders(jwt, {
-    ...(clientId ? { "x-capy-client-id": clientId } : {}),
-    ...extra,
-  });
+export function clientHeaders(jwt: string, extra: Record<string, string> = {}): Record<string, string> {
+  return appHeaders(jwt, extra);
 }
 
 export function publicHeaders(apiKey: string, extra: Record<string, string> = {}): Record<string, string> {

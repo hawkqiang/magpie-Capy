@@ -12,9 +12,9 @@ Accepted
 ## 决策
 
 - 主路径：原生 SSE；不轮询。
-- `StreamNormalizer` 把上游事件归一成 `ChatEvent`（delta/final/usage/error/done）。
+- `StreamNormalizer` 把上游事件归一成 `ChatEvent`（delta/final/error/done）。
 - `OpenAISseEncoder` 是唯一知道 `data:`/`[DONE]` 的地方。
-- 仅当流不可用且**没有发出任何 delta** 时，才允许 outline 轮询 fallback。
+- 流不可用时返回明确错误；outline 轮询 fallback 未实现，不静默切换。
 - assistant 帧按 `callId` 累积；重复全文去前缀；transcript 校正最终文本。
 
 ## 后果

@@ -52,8 +52,7 @@ function fakeApp() {
       calls.push(input);
       return {
         id: input.jamId,
-        primaryMachine: { kind: "device", name: "magpie-headless" },
-        ask: null,
+        primaryMachine: { kind: "device" },
       };
     },
     async getJam(_jwt, _org, id) {
@@ -194,4 +193,27 @@ test("ChatUseCase：cancel 调 interrupt", async () => {
   });
   await useCase.cancel(session, "jam_1");
   expect(interrupted()).toBe(1);
+});
+
+test("ChatUseCase：getJam 失败返回明确错误，不返回空完成", async () => {
+  const base = fakeApp();
+  const app: CapyAppPort = {
+    ...base.app,
+    async getJam() { throw new Error("status lookup failed"); },
+  };
+  const useCase = new ChatUseCase({
+    app,
+    publicApi: fakePublic([]),
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: false,
+  });
+  const events = [];
+  for await (const event of useCase.stream(session, request)) events.push(event);
+  expect(events[0]?.type).toBe("error");
+  if (events[0]?.type === "error") {
+    expect(events[0].error.kind).toBe("upstream_unavailable");
+  }
 });

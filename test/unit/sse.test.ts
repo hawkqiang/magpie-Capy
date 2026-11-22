@@ -21,11 +21,9 @@ test("SSE：CRLF 与多行 data", () => {
 test("SSE：注释/retry/空帧", () => {
   const parser = new SseParser();
   const frames = parser.feed(": comment\nretry: 2000\n\nevent: done\ndata: {}\n\n");
-  expect(frames).toHaveLength(2);
-  expect(frames[0]?.event).toBe("");
-  expect(frames[0]?.retry).toBe(2000);
-  expect(frames[1]?.event).toBe("done");
-  expect(frames[1]?.retry).toBeUndefined();
+  expect(frames).toHaveLength(1);
+  expect(frames[0]?.event).toBe("done");
+  expect(frames[0]?.data).toBe("{}");
 });
 
 test("SSE：字节流解码", async () => {

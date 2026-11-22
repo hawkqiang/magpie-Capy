@@ -1,7 +1,5 @@
-import os from "node:os";
-
 import type { ClerkSession } from "../../domain/account.ts";
-import { CapyError, mapUpstream } from "../../domain/errors.ts";
+import { CapyError } from "../../domain/errors.ts";
 import type {
   AccountProfile,
   CapyAppPort,
@@ -14,18 +12,16 @@ import type {
   JamEvent,
   Organization,
 } from "../../ports/capy-app.ts";
-import { requestJson } from "../platform/http.ts";
+import { requestCapyJson } from "../platform/http.ts";
 import { ClerkClient } from "./clerk-client.ts";
 import { CAPY_APP, clientHeaders } from "./endpoints.ts";
 
-function deviceOs(): string {
-  if (process.platform === "win32") return "win32";
-  if (process.platform === "darwin") return "darwin";
-  return "linux";
-}
-
-function deviceArch(): string {
-  return process.arch === "arm64" ? "arm64" : "x86_64";
+function itemsOf(body: unknown): unknown[] {
+  if (Array.isArray(body)) return body;
+  if (body && typeof body === "object" && Array.isArray((body as { items?: unknown }).items)) {
+    return (body as { items: unknown[] }).items;
+  }
+  return [];
 }
 
 export class CapyAppClient implements CapyAppPort {
@@ -59,12 +55,7 @@ export class CapyAppClient implements CapyAppPort {
 
   async organizations(jwt: string, signal?: AbortSignal): Promise<readonly Organization[]> {
     const body = await this.json(jwt, "/organizations", { method: "GET", ...(signal ? { signal } : {}) });
-    const list = Array.isArray(body)
-      ? body
-      : body && typeof body === "object" && Array.isArray((body as { items?: unknown }).items)
-        ? (body as { items: unknown[] }).items
-        : [];
-    return list.flatMap((item): Organization[] => {
+    return itemsOf(body).flatMap((item): Organization[] => {
       if (!item || typeof item !== "object") return [];
       const record = item as Record<string, unknown>;
       const id = typeof record.id === "string" ? record.id : "";
@@ -104,12 +95,7 @@ export class CapyAppClient implements CapyAppPort {
       method: "GET",
       ...(signal ? { signal } : {}),
     });
-    const list = Array.isArray(body)
-      ? body
-      : body && typeof body === "object" && Array.isArray((body as { items?: unknown }).items)
-        ? (body as { items: unknown[] }).items
-        : [];
-    return list.flatMap((item): DeviceInfo[] => {
+    return itemsOf(body).flatMap((item): DeviceInfo[] => {
       if (!item || typeof item !== "object") return [];
       const record = item as Record<string, unknown>;
       const id = typeof record.id === "string" ? record.id : "";
@@ -144,9 +130,9 @@ export class CapyAppClient implements CapyAppPort {
     const body = await this.json(jwt, "/devices/code", {
       method: "POST",
       body: JSON.stringify({
-        hostname: input.hostname || os.hostname(),
-        os: input.os || deviceOs(),
-        arch: input.arch || deviceArch(),
+        hostname: input.hostname,
+        os: input.os,
+        arch: input.arch,
       }),
       ...(signal ? { signal } : {}),
     });
@@ -253,17 +239,7 @@ export class CapyAppClient implements CapyAppPort {
       : "";
     return {
       id,
-      primaryMachine: {
-        kind: kind === "cloud" ? "cloud" : "device",
-        ...(machine && typeof machine === "object" && !Array.isArray(machine)
-          && typeof (machine as Record<string, unknown>).name === "string"
-          ? { name: String((machine as Record<string, unknown>).name) }
-          : {}),
-      },
-      ...(record.ask === null || record.ask && typeof record.ask === "object" ? { ask: record.ask as NonNullable<JamCreated["ask"]> } : {}),
-      ...(record.modelDefault && typeof record.modelDefault === "object"
-        ? { modelDefault: record.modelDefault as NonNullable<JamCreated["modelDefault"]> }
-        : {}),
+      primaryMachine: { kind: kind === "cloud" ? "cloud" : "device" },
     };
   }
 
@@ -305,11 +281,9 @@ export class CapyAppClient implements CapyAppPort {
       return [{
         id,
         kind,
-        ...(typeof value.state === "string" ? { state: value.state } : {}),
         payload: {
           ...(typeof payload.code === "string" ? { code: payload.code } : {}),
           ...(typeof payload.message === "string" ? { message: payload.message } : {}),
-          ...(typeof payload.retryable === "boolean" ? { retryable: payload.retryable } : {}),
         },
       }];
     });
@@ -329,17 +303,12 @@ export class CapyAppClient implements CapyAppPort {
     init: RequestInit & { signal?: AbortSignal },
     extraHeaders: Record<string, string> = {},
   ): Promise<unknown> {
-    const { response, body, text } = await requestJson(
+    return await requestCapyJson(
       this.fetchImpl,
       `${CAPY_APP}${route}`,
-      {
-        ...init,
-        headers: clientHeaders(jwt, "", extraHeaders),
-      },
+      { ...init, headers: clientHeaders(jwt, extraHeaders) },
       30_000,
     );
-    if (!response.ok) throw mapUpstream(response.status, body, text.slice(0, 300));
-    return body;
   }
 }
 

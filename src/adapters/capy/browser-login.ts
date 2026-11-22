@@ -6,6 +6,7 @@ import path from "node:path";
 
 import { CapyError } from "../../domain/errors.ts";
 import type { LoginCredential, LoginSourcePort } from "../../ports/login.ts";
+import { decodeJwtPayload } from "../platform/jwt.ts";
 import { readCapyInstall } from "./local-login.ts";
 
 const LOGIN_URL = "https://capy.ai/sign-in";
@@ -66,24 +67,37 @@ interface CdpMessage {
 class CdpConnection {
   private readonly ws: WebSocket;
   private nextId = 1;
-  private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  private readonly pending = new Map<number, {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   constructor(ws: WebSocket) {
     this.ws = ws;
     ws.addEventListener("message", (event) => this.onMessage(event));
     ws.addEventListener("close", () => {
-      for (const item of this.pending.values()) item.reject(new Error("CDP 连接已关闭"));
+      for (const item of this.pending.values()) {
+        clearTimeout(item.timer);
+        item.reject(new Error("CDP 连接已关闭"));
+      }
       this.pending.clear();
     });
   }
 
-  send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  send(method: string, params: Record<string, unknown> = {}, timeoutMs = 10_000): Promise<unknown> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP ${method} 超时`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, timer });
       try {
         this.ws.send(JSON.stringify({ id, method, params }));
       } catch (error) {
+        clearTimeout(timer);
         this.pending.delete(id);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
@@ -100,14 +114,18 @@ class CdpConnection {
     if (typeof message.id !== "number") return;
     const item = this.pending.get(message.id);
     if (!item) return;
+    clearTimeout(item.timer);
     this.pending.delete(message.id);
     if (message.error) item.reject(new Error(message.error.message || "CDP error"));
     else item.resolve(message.result);
   }
 }
 
-async function cdpJson(port: number, route: string): Promise<unknown> {
-  const response = await fetch(`http://127.0.0.1:${port}${route}`);
+async function cdpJson(port: number, route: string, signal?: AbortSignal): Promise<unknown> {
+  const timeout = AbortSignal.timeout(2_000);
+  const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
   if (!response.ok) return null;
   try { return await response.json(); } catch { return null; }
 }
@@ -147,18 +165,27 @@ async function connectPage(port: number, signal: AbortSignal, timeoutMs: number)
 
 function waitOpen(ws: WebSocket, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch {}
+      reject(new Error("浏览器 CDP WebSocket 连接超时"));
+    }, 10_000);
+    timer.unref?.();
     const onAbort = () => {
+      clearTimeout(timer);
       try { ws.close(); } catch {}
       reject(abortError());
     };
     if (signal.aborted) return onAbort();
     signal.addEventListener("abort", onAbort, { once: true });
     ws.addEventListener("open", () => {
+      clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
       resolve();
     }, { once: true });
     ws.addEventListener("error", () => {
+      clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
+      try { ws.close(); } catch {}
       reject(new CapyError("upstream_unavailable", "浏览器 CDP WebSocket 连接失败"));
     }, { once: true });
   });
@@ -209,16 +236,8 @@ async function readCookie(cdp: CdpConnection): Promise<string> {
 }
 
 function clientIdOf(clientJwt: string): string {
-  const part = clientJwt.split(".")[1];
-  if (!part) return "";
-  try {
-    const value: unknown = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value)) return "";
-    const id = (value as Record<string, unknown>).id;
-    return typeof id === "string" ? id : "";
-  } catch {
-    return "";
-  }
+  const payload = decodeJwtPayload(clientJwt);
+  return typeof payload?.id === "string" ? payload.id : "";
 }
 
 function freePort(): Promise<number> {
@@ -302,45 +321,45 @@ async function chromiumLogin(options: {
 
     const deadline = Date.now() + timeoutMs;
     let sawClerk = false;
-    let sawCookieProblem = false;
-    while (Date.now() < deadline) {
-      throwIfAborted(signal);
-      if (child && browserExited(child)) {
-        throw new CapyError("sign_in_required", "Capy 登录浏览器已关闭，请重新发起登录");
-      }
-      let cdp: CdpConnection | null = null;
-      try {
-        cdp = await connectPage(port, signal, 5_000);
-        const stateRaw = await evaluate<string>(cdp, CLERK_STATE);
-        if (stateRaw) {
-          sawClerk = true;
-          let state: { sessionId?: string; userId?: string } | null = null;
-          try { state = JSON.parse(stateRaw) as { sessionId?: string; userId?: string }; } catch {}
-          const clientJwt = await readCookie(cdp);
-          if (!clientJwt) {
-            sawCookieProblem = true;
-          } else if (state?.sessionId && state.userId) {
-            const orgId = await evaluate<string>(cdp, SELECTED_ORG).catch(() => "");
-            const credential: LoginCredential = {
-              clientJwt,
-              sessionId: state.sessionId,
-              userId: state.userId,
-              clientId: clientIdOf(clientJwt),
-              ...(orgId ? { orgId: String(orgId) } : {}),
-              source: "browser",
-            };
-            return credential;
-          }
+    let cdp: CdpConnection | null = null;
+    try {
+      while (Date.now() < deadline) {
+        throwIfAborted(signal);
+        if (child && browserExited(child)) {
+          throw new CapyError("sign_in_required", "Capy 登录浏览器已关闭，请重新发起登录");
         }
-      } catch (error) {
-        if (signal.aborted) throw abortError();
-        if (error instanceof CapyError && error.kind === "sign_in_required") throw error;
-      } finally {
-        cdp?.close();
+        try {
+          cdp ??= await connectPage(port, signal, 5_000);
+          const stateRaw = await evaluate<string>(cdp, CLERK_STATE);
+          if (stateRaw) {
+            sawClerk = true;
+            let state: { sessionId?: string; userId?: string } | null = null;
+            try { state = JSON.parse(stateRaw) as { sessionId?: string; userId?: string }; } catch {}
+            const clientJwt = await readCookie(cdp);
+            if (clientJwt && state?.sessionId && state.userId) {
+              const orgId = await evaluate<string>(cdp, SELECTED_ORG).catch(() => "");
+              return {
+                clientJwt,
+                sessionId: state.sessionId,
+                userId: state.userId,
+                clientId: clientIdOf(clientJwt),
+                ...(orgId ? { orgId: String(orgId) } : {}),
+                source: "browser",
+              };
+            }
+          }
+        } catch (error) {
+          cdp?.close();
+          cdp = null;
+          if (signal.aborted) throw abortError();
+          if (error instanceof CapyError && error.kind === "sign_in_required") throw error;
+        }
+        await sleep(POLL_MS, signal);
       }
-      await sleep(POLL_MS, signal);
+    } finally {
+      cdp?.close();
     }
-    if (sawClerk || sawCookieProblem) {
+    if (sawClerk) {
       throw new CapyError(
         "sign_in_required",
         "已在 Capy 登录，但读不到 __client Cookie。请让浏览器停留在 capy.ai 页面后重试",
@@ -348,10 +367,23 @@ async function chromiumLogin(options: {
     }
     throw new CapyError("upstream_timeout", "等待 Capy 浏览器登录超时，请重试");
   } finally {
-    try { child?.kill("SIGTERM"); } catch {}
+    if (child) killTree(child);
     setTimeout(() => {
       try { fs.rmSync(profile, { recursive: true, force: true }); } catch {}
     }, 1000).unref?.();
+  }
+}
+
+function killTree(child: ChildProcess): void {
+  try { child.kill("SIGTERM"); } catch {}
+  if (process.platform === "win32" && child.pid) {
+    try {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      killer.unref();
+    } catch {}
   }
 }
 

@@ -108,28 +108,30 @@ function tryJson(text: string): unknown {
 
 function balancedObjects(text: string): string[] {
   const out: string[] = [];
-  for (let start = 0; start < text.length; start += 1) {
-    if (text[start] !== "{") continue;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let i = start; i < text.length; i += 1) {
-      const ch = text[i];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (ch === "\\") escaped = true;
-        else if (ch === '"') inString = false;
-        continue;
-      }
-      if (ch === '"') inString = true;
-      else if (ch === "{") depth += 1;
-      else if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          out.push(text.slice(start, i + 1));
-          start = i;
-          break;
-        }
+  const starts: number[] = [];
+  let inString = false;
+  let escaped = false;
+  let steps = 0;
+  const budget = Math.min(1_000_000, Math.max(10_000, text.length * 2));
+
+  for (let i = 0; i < text.length; i += 1) {
+    steps += 1;
+    if (steps > budget) break;
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") starts.push(i);
+    else if (ch === "}") {
+      const start = starts.pop();
+      if (start === undefined) continue;
+      if (starts.length === 0) {
+        out.push(text.slice(start, i + 1));
+        if (out.length >= 32) break;
       }
     }
   }

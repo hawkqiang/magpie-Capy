@@ -225,7 +225,6 @@ Upstream SSE frame → protocol/sse parse → StreamNormalizer
 - `ModelDescriptor` 来自 catalog；`CapabilityRegistry` 把 descriptor → OpenAI capabilities。
 - `ModelPolicy`：
   - `freeFirst()`
-  - `vendorAllowlist()`
   - `contextBudget()`
   - 未来 `costAware()` / `latencyAware()`
 - `ToolBridge`：

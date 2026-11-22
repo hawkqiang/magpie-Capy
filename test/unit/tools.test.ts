@@ -42,3 +42,8 @@ test("parse：普通文本 / 非工具 JSON → null", () => {
   expect(bridge.parse("pong")).toBeNull();
   expect(bridge.parse("{\"a\":1}")).toBeNull();
 });
+
+test("parse：大量未闭合花括号不会平方级扫描", () => {
+  const text = "{".repeat(5_000);
+  expect(new PromptToolBridge().parse(text)).toBeNull();
+});

@@ -145,6 +145,14 @@ export interface ChunkMeta {
   readonly created: number;
 }
 
+const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const SSE_HEADERS = {
+  "content-type": "text/event-stream; charset=utf-8",
+  "cache-control": "no-cache",
+  connection: "keep-alive",
+};
+const SSE_DONE = "data: [DONE]\n\n";
+
 function encodeChunk(meta: ChunkMeta, delta: Record<string, unknown>, finishReason: string | null = null): string {
   return `data: ${JSON.stringify({
     id: meta.id,
@@ -155,10 +163,6 @@ function encodeChunk(meta: ChunkMeta, delta: Record<string, unknown>, finishReas
   })}\n\n`;
 }
 
-function encodeContentDelta(meta: ChunkMeta, text: string): string {
-  return encodeChunk(meta, { content: text });
-}
-
 export interface ToolCallOut {
   readonly id: string;
   readonly name: string;
@@ -166,16 +170,14 @@ export interface ToolCallOut {
 }
 
 export function encodeToolCallCompletion(
-  id: string,
-  model: string,
-  created: number,
+  meta: ChunkMeta,
   calls: readonly ToolCallOut[],
 ): Response {
   return new Response(JSON.stringify({
-    id,
+    id: meta.id,
     object: "chat.completion",
-    created,
-    model,
+    created: meta.created,
+    model: meta.model,
     choices: [{
       index: 0,
       message: {
@@ -189,7 +191,7 @@ export function encodeToolCallCompletion(
       },
       finish_reason: "tool_calls",
     }],
-  }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+  }), { status: 200, headers: JSON_HEADERS });
 }
 
 export function encodeToolCallStream(meta: ChunkMeta, calls: readonly ToolCallOut[]): Response {
@@ -206,14 +208,7 @@ export function encodeToolCallStream(meta: ChunkMeta, calls: readonly ToolCallOu
     encodeChunk(meta, {}, "tool_calls"),
     SSE_DONE,
   ].join("");
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
+  return new Response(body, { status: 200, headers: SSE_HEADERS });
 }
 
 export function encodeCompletion(id: string, model: string, created: number, text: string): Response {
@@ -228,7 +223,7 @@ export function encodeCompletion(id: string, model: string, created: number, tex
       finish_reason: "stop",
     }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-  }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+  }), { status: 200, headers: JSON_HEADERS });
 }
 
 export function encodeErrorResponse(error: unknown): Response {
@@ -236,7 +231,7 @@ export function encodeErrorResponse(error: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: body.error.status,
     headers: {
-      "content-type": "application/json; charset=utf-8",
+      ...JSON_HEADERS,
       ...(body.error.status === 401 ? { "x-magpie-sign-in": "expired" } : {}),
     },
   });
@@ -246,7 +241,6 @@ function encodeSseError(error: unknown): string {
   return `data: ${JSON.stringify(toOpenAiError(error))}\n\ndata: [DONE]\n\n`;
 }
 
-const SSE_DONE = "data: [DONE]\n\n";
 
 export function encodeModelList(models: readonly { id: string; name: string }[], provider: string): Response {
   return new Response(JSON.stringify({
@@ -258,7 +252,7 @@ export function encodeModelList(models: readonly { id: string; name: string }[],
       owned_by: provider,
       name: model.name,
     })),
-  }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+  }), { status: 200, headers: JSON_HEADERS });
 }
 
 /** 把 ChatEvent 流编码成 OpenAI SSE Response。 */
@@ -270,43 +264,37 @@ export function encodeChatStream(
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const push = (text: string) => controller.enqueue(encoder.encode(text));
+      const finish = () => {
+        push(encodeChunk(meta, {}, "stop"));
+        push(SSE_DONE);
+        controller.close();
+      };
       push(encodeChunk(meta, { role: "assistant", content: "" }));
       let emitted = false;
       try {
         for await (const event of events) {
           if (event.type === "delta") {
             emitted = true;
-            push(encodeContentDelta(meta, event.text));
+            push(encodeChunk(meta, { content: event.text }));
           } else if (event.type === "error") {
             push(encodeSseError(event.error));
             controller.close();
             return;
           } else if (event.type === "final") {
-            if (!emitted && event.text) push(encodeContentDelta(meta, event.text));
+            if (!emitted && event.text) push(encodeChunk(meta, { content: event.text }));
           } else if (event.type === "done") {
-            push(encodeChunk(meta, {}, "stop"));
-            push(SSE_DONE);
-            controller.close();
+            finish();
             return;
           }
         }
-        push(encodeChunk(meta, {}, "stop"));
-        push(SSE_DONE);
-        controller.close();
+        finish();
       } catch (error) {
         push(encodeSseError(error));
         controller.close();
       }
     },
   });
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
+  return new Response(stream, { status: 200, headers: SSE_HEADERS });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -315,4 +303,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function invalid(message: string): CapyError {
   return new CapyError("invalid_request", message);
+}
+
+export async function collectText(events: AsyncIterable<ChatEvent>): Promise<string> {
+  let text = "";
+  for await (const event of events) {
+    if (event.type === "delta") text += event.text;
+    else if (event.type === "final" && !text) text = event.text;
+    else if (event.type === "error") throw event.error;
+  }
+  return text;
+}
+
+export async function* textEvents(text: string): AsyncIterable<ChatEvent> {
+  if (text) yield { type: "delta", text };
+  yield { type: "done" };
 }

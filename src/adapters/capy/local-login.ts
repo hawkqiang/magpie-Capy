@@ -5,6 +5,7 @@ import path from "node:path";
 import { CapyError } from "../../domain/errors.ts";
 import type { LoginCredential } from "../../ports/login.ts";
 import { coerceAesKey, decryptChromiumAesGcm, dpapiUnprotect } from "../platform/dpapi.ts";
+import { decodeJwtPayload } from "../platform/jwt.ts";
 
 const DPAPI_PREFIX = "DPAPI";
 
@@ -34,15 +35,9 @@ function stringOf(value: unknown): string {
 }
 
 function jwtPayload(token: string): Record<string, unknown> {
-  const part = token.split(".")[1];
-  if (!part) throw new CapyError("sign_in_required", "Capy 登录凭据不是有效 JWT");
-  try {
-    const value: unknown = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("not object");
-    return value as Record<string, unknown>;
-  } catch {
-    throw new CapyError("sign_in_required", "Capy 登录凭据的 JWT payload 无法解析");
-  }
+  const value = decodeJwtPayload(token);
+  if (!value) throw new CapyError("sign_in_required", "Capy 登录凭据的 JWT payload 无法解析");
+  return value;
 }
 
 interface CapyInstallCredential extends LoginCredential {

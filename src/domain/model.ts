@@ -11,7 +11,6 @@ export interface ModelCapabilities {
 export interface ModelDescriptor {
   readonly id: string;
   readonly name: string;
-  readonly vendor: string;
   readonly free: boolean;
   readonly reasoningModes: readonly string[];
   readonly capabilities: ModelCapabilities;
@@ -23,29 +22,7 @@ export interface RawModel {
   readonly reasoningModes?: readonly string[];
 }
 
-/** Capy `/models.default`：默认链和其中不能运行的模型。 */
-export interface ModelDefaultInfo {
-  readonly modelId: string;
-  readonly source: string;
-  readonly skipped?: readonly {
-    readonly modelId: string;
-    readonly source: string;
-    readonly reason: string;
-  }[];
-}
 
-/** 厂商定价页确认的 $0.00 模型。不要从 rate/billing 反推。 */
-const FREE_MODEL_IDS: ReadonlySet<string> = new Set([
-  "particle/particle-1",
-  "zai/glm-5.3-flash-ads",
-  "deepseek/deepseek-v4.1-flash-ads",
-]);
-
-/** App 内免费广告模型：建线程必须带 `ads-models` 客户端能力位。 */
-const ADS_MODEL_IDS: ReadonlySet<string> = new Set([
-  "zai/glm-5.3-flash-ads",
-  "deepseek/deepseek-v4.1-flash-ads",
-]);
 
 /** 公共 /models 不返回的两个 App 内免费广告模型。 */
 export const EXTRA_FREE_MODELS: readonly RawModel[] = [
@@ -61,17 +38,18 @@ export const EXTRA_FREE_MODELS: readonly RawModel[] = [
   },
 ];
 
+/** App 内免费广告模型：建线程必须带 `ads-models` 客户端能力位。 */
+const ADS_MODEL_IDS: ReadonlySet<string> = new Set(EXTRA_FREE_MODELS.map((model) => model.id));
+
+/** 厂商定价页确认的 $0.00 模型。 */
+const FREE_MODEL_IDS: ReadonlySet<string> = new Set(["particle/particle-1", ...ADS_MODEL_IDS]);
+
 export function isFreeModel(id: string): boolean {
   return FREE_MODEL_IDS.has(String(id).trim());
 }
 
 export function isAdsModel(id: string): boolean {
   return ADS_MODEL_IDS.has(String(id).trim());
-}
-
-function vendorOf(id: string): string {
-  const slash = id.indexOf("/");
-  return slash > 0 ? id.slice(0, slash) : "capy";
 }
 
 function normalizeModes(modes: readonly string[] | undefined): string[] {
@@ -91,7 +69,6 @@ export function describeModel(raw: RawModel, options: { toolsEnabled: boolean })
   return {
     id,
     name,
-    vendor: vendorOf(id),
     free: isFreeModel(id),
     reasoningModes,
     capabilities: {
@@ -116,10 +93,10 @@ export function freeFirst<T extends { id: string }>(models: readonly T[]): T[] {
   return [...models].sort((a, b) => Number(isFreeModel(b.id)) - Number(isFreeModel(a.id)));
 }
 
-export function resolveModelId(
+export function resolveModel(
   requested: unknown,
   models: readonly ModelDescriptor[],
-): string {
+): ModelDescriptor {
   const wanted = typeof requested === "string" ? requested.trim() : "";
   // 调用方没有 model 时应在建线程时省略 modelId，让 Capy 走默认链；
   // 这里只解析显式 id，不发明“第一个模型就是默认”。
@@ -129,20 +106,24 @@ export function resolveModelId(
   const strip = (value: string) => value.replace(/^capy\//iu, "");
   const target = strip(wanted);
   const byId = models.find((model) => model.id === wanted || model.id === target);
-  if (byId) return byId.id;
+  if (byId) return byId;
 
   const short = target.split("/").pop() ?? target;
   const byShort = models.find((model) => (model.id.split("/").pop() ?? model.id) === short);
-  if (byShort) return byShort.id;
+  if (byShort) return byShort;
 
   const normalize = (value: string) => value.toLowerCase().replace(/[\s._-]+/gu, "");
   const norm = normalize(target);
   const byName = models.find(
     (model) => normalize(model.name) === norm || normalize(model.id) === norm,
   );
-  if (byName) return byName.id;
+  if (byName) return byName;
 
   throw new CapyError("model_not_found", `Capy 不认识模型 "${wanted}"`, { detail: wanted });
+}
+
+export function resolveModelId(requested: unknown, models: readonly ModelDescriptor[]): string {
+  return resolveModel(requested, models).id;
 }
 
 export function reasoningModeOf(request: { reasoningEffort?: string }, model: ModelDescriptor | undefined): string {

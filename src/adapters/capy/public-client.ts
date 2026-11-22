@@ -1,6 +1,6 @@
-import type { ModelDefaultInfo, RawModel } from "../../domain/model.ts";
+import type { RawModel } from "../../domain/model.ts";
 import type { Balance, UsageTotals } from "../../domain/usage.ts";
-import { CapyError, mapUpstream } from "../../domain/errors.ts";
+import { CapyError, errorText, mapUpstream } from "../../domain/errors.ts";
 import type {
   CapyPublicPort,
   UpstreamSseFrame,
@@ -8,7 +8,7 @@ import type {
   UploadedFile,
 } from "../../ports/capy-public.ts";
 import { decodeSseStream } from "../../protocol/sse.ts";
-import { requestJson } from "../platform/http.ts";
+import { requestCapyJson } from "../platform/http.ts";
 import { CAPY_PUBLIC, publicHeaders } from "./endpoints.ts";
 
 function rawModels(items: unknown): RawModel[] {
@@ -29,28 +29,6 @@ function rawModels(items: unknown): RawModel[] {
   });
 }
 
-function modelDefault(value: unknown): ModelDefaultInfo | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  const modelId = typeof record.modelId === "string" ? record.modelId : "";
-  if (!modelId) return undefined;
-  const skipped = Array.isArray(record.skipped)
-    ? record.skipped.flatMap((item) => {
-      if (!item || typeof item !== "object") return [];
-      const s = item as Record<string, unknown>;
-      return [{
-        modelId: String(s.modelId ?? ""),
-        source: String(s.source ?? ""),
-        reason: String(s.reason ?? ""),
-      }];
-    })
-    : [];
-  return {
-    modelId,
-    source: typeof record.source === "string" ? record.source : "",
-    ...(skipped.length > 0 ? { skipped } : {}),
-  };
-}
 
 export class CapyPublicClient implements CapyPublicPort {
   private readonly fetchImpl: typeof fetch;
@@ -61,21 +39,15 @@ export class CapyPublicClient implements CapyPublicPort {
 
   async listModels(apiKey: string, signal?: AbortSignal): Promise<{
     readonly items: readonly RawModel[];
-    readonly default?: ModelDefaultInfo;
   }> {
-    const { response, body, text } = await requestJson(
+    const body = await requestCapyJson(
       this.fetchImpl,
       `${CAPY_PUBLIC}/models`,
       { method: "GET", headers: publicHeaders(apiKey), ...(signal ? { signal } : {}) },
       20_000,
     );
-    if (!response.ok) throw mapUpstream(response.status, body, text.slice(0, 300));
     const record = body as Record<string, unknown>;
-    const fallback = modelDefault(record.default);
-    return {
-      items: rawModels(record.items),
-      ...(fallback ? { default: fallback } : {}),
-    };
+    return { items: rawModels(record.items) };
   }
 
   async *streamThread(
@@ -108,10 +80,15 @@ export class CapyPublicClient implements CapyPublicPort {
     const body = response.body;
     async function* chunks(): AsyncIterable<Uint8Array> {
       const reader = body.getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) return;
-        if (value) yield value;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) return;
+          if (value) yield value;
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
       }
     }
     for await (const frame of decodeSseStream(chunks())) {
@@ -129,7 +106,7 @@ export class CapyPublicClient implements CapyPublicPort {
     signal?: AbortSignal,
   ): Promise<readonly UploadedFile[]> {
     if (files.length === 0) return [];
-    const { response, body, text } = await requestJson(
+    const body = await requestCapyJson(
       this.fetchImpl,
       `${CAPY_PUBLIC}/files`,
       {
@@ -146,7 +123,6 @@ export class CapyPublicClient implements CapyPublicPort {
       },
       30_000,
     );
-    if (!response.ok) throw mapUpstream(response.status, body, text.slice(0, 300));
     const targets = (body as { targets?: unknown })?.targets;
     if (!Array.isArray(targets) || targets.length !== files.length) {
       throw new CapyError("upstream_error", "Capy 没有返回足够的文件上传目标");
@@ -158,14 +134,13 @@ export class CapyPublicClient implements CapyPublicPort {
       if (!file || !target || typeof target.fileId !== "string" || typeof target.url !== "string") {
         throw new CapyError("upstream_error", "Capy 文件上传目标缺少 fileId/url");
       }
+      const timeout = AbortSignal.timeout(60_000);
+      const putSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
       const put = await this.fetchImpl(target.url, {
         method: "PUT",
-        headers: {
-          "content-type": file.mediaType,
-          "content-length": String(file.bytes.length),
-        },
+        headers: { "content-type": file.mediaType },
         body: file.bytes as unknown as BodyInit,
-        ...(signal ? { signal } : {}),
+        signal: putSignal,
       });
       if (!put.ok) {
         const detail = await put.text().catch(() => "");
@@ -184,28 +159,22 @@ export class CapyPublicClient implements CapyPublicPort {
   }
 
   async usage(apiKey: string, signal?: AbortSignal): Promise<UsageTotals> {
-    const { response, body, text } = await requestJson(
+    const body = await requestCapyJson(
       this.fetchImpl,
       `${CAPY_PUBLIC}/usage`,
       { method: "GET", headers: publicHeaders(apiKey), ...(signal ? { signal } : {}) },
       20_000,
     );
-    if (!response.ok) throw mapUpstream(response.status, body, text.slice(0, 300));
     return (body ?? {}) as UsageTotals;
   }
 
   async balance(apiKey: string, signal?: AbortSignal): Promise<Balance> {
-    const { response, body, text } = await requestJson(
+    const body = await requestCapyJson(
       this.fetchImpl,
       `${CAPY_PUBLIC}/usage/balance`,
       { method: "GET", headers: publicHeaders(apiKey), ...(signal ? { signal } : {}) },
       20_000,
     );
-    if (!response.ok) throw mapUpstream(response.status, body, text.slice(0, 300));
     return (body ?? {}) as Balance;
   }
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

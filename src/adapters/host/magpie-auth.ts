@@ -1,4 +1,4 @@
-import type { AccountSession } from "../../domain/account.ts";
+import { SESSION_TTL_MS, type AccountSession } from "../../domain/account.ts";
 import { CapyError } from "../../domain/errors.ts";
 
 interface StoredRefresh {
@@ -39,12 +39,11 @@ export function sessionOfAuth(auth: unknown): AccountSession {
   const metadata = record.metadata && typeof record.metadata === "object" && !Array.isArray(record.metadata)
     ? record.metadata as Record<string, unknown>
     : {};
-  const orgId = refresh.orgId
-    ?? (typeof metadata.orgId === "string" ? metadata.orgId : "");
+  const orgId = refresh.orgId || (typeof metadata.orgId === "string" ? metadata.orgId : "");
   if (!orgId) throw new CapyError("sign_in_required", "Capy 登录态缺少组织，请重新登录");
   const uid = refresh.userId
-    ?? (typeof metadata.userId === "string" ? metadata.userId : "")
-    ?? (typeof record.uid === "string" ? record.uid : "");
+    || (typeof metadata.userId === "string" ? metadata.userId : "")
+    || (typeof record.uid === "string" ? record.uid : "");
   const accountId = typeof record.accountId === "string" && record.accountId
     ? record.accountId
     : uid || access.slice(-8);
@@ -52,7 +51,7 @@ export function sessionOfAuth(auth: unknown): AccountSession {
     accountId,
     uid,
     orgId,
-    clientId: refresh.clientId ?? (typeof metadata.clientId === "string" ? metadata.clientId : ""),
+    clientId: refresh.clientId || (typeof metadata.clientId === "string" ? metadata.clientId : ""),
     accessToken: access,
     clerk: { clientJwt: refresh.clientJwt, sessionId: refresh.sessionId },
     source: "refresh",
@@ -72,7 +71,7 @@ export function authRecordOf(session: AccountSession): Record<string, unknown> {
       userId: session.uid,
       clientId: session.clientId,
     }),
-    expires: Date.now() + 7 * 24 * 3600_000,
+    expires: Date.now() + SESSION_TTL_MS,
     accountId: session.accountId,
     uid: session.uid,
     metadata: {

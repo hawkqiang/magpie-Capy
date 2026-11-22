@@ -1,4 +1,4 @@
-import { isAuthError } from "../domain/errors.ts";
+import { errorText, isAbort, isAuthError } from "../domain/errors.ts";
 import type { Balance, UsageSnapshot, UsageTotals, UsageWindow } from "../domain/usage.ts";
 import type { CapyPublicPort } from "../ports/capy-public.ts";
 import type { CachePort } from "../ports/platform.ts";
@@ -18,8 +18,9 @@ export class UsageUseCase {
     this.options = options;
   }
 
-  async load(apiKey: string, signal?: AbortSignal): Promise<UsageSnapshot> {
-    const key = `usage:${apiKey.slice(-16)}`;
+  async load(apiKey: string, signal?: AbortSignal, accountKey?: string): Promise<UsageSnapshot> {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const key = `usage:${accountKey ?? apiKey.slice(-16)}`;
     const hit = this.options.cache?.get<UsageSnapshot>(key);
     if (hit) return hit;
     try {
@@ -31,11 +32,9 @@ export class UsageUseCase {
       this.options.cache?.set(key, snapshot, this.options.cacheTtlMs ?? DEFAULT_TTL_MS);
       return snapshot;
     } catch (error) {
+      if (isAbort(error) || signal?.aborted) throw error;
       if (isAuthError(error)) throw error;
-      return {
-        windows: [],
-        error: error instanceof Error ? error.message : String(error),
-      };
+      return { windows: [], error: errorText(error) };
     }
   }
 }

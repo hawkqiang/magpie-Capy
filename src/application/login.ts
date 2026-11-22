@@ -31,9 +31,19 @@ export class LoginUseCase {
     const jwt = await this.options.app.sessionJwt(clerk, signal);
     const me = await this.options.app.me(jwt, signal);
     const orgs = await this.options.app.organizations(jwt, signal);
+    const ids = orgs.map((org) => org.id);
+    const wanted = String(credential.orgId ?? "").trim();
+    if (wanted && !ids.includes(wanted)) {
+      throw new CapyError("invalid_request", `登录凭据指定的组织 ${wanted} 不在账号组织列表里`);
+    }
     const orgId = pickOrg(orgs, credential.orgId, me.preferredOrgId);
     if (!orgId) {
-      throw new CapyError("invalid_request", "这个 Capy 账号没有组织（org），请先在 Capy 里完成初始化");
+      throw new CapyError(
+        "invalid_request",
+        ids.length > 1
+          ? "这个 Capy 账号有多个组织，请在登录凭据里明确指定 org"
+          : "这个 Capy 账号没有组织（org），请先在 Capy 里完成初始化",
+      );
     }
     const key = await this.options.app.mintApiKey(
       jwt,

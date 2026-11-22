@@ -51,7 +51,6 @@ test("reasoningModeOf：只接受模型档位", () => {
 
 test("describeModel：能力/厂商", () => {
   const model = describeModel({ id: "anthropic/claude-fable-5.2", reasoningModes: ["high"] }, { toolsEnabled: true });
-  expect(model.vendor).toBe("anthropic");
   expect(model.capabilities.image).toBe(true);
   expect(model.capabilities.pdf).toBe(true);
   expect(model.capabilities.tools).toBe(true);

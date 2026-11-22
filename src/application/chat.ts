@@ -3,7 +3,7 @@ import { accountKey } from "../domain/account.ts";
 import type { ChatEvent, ChatRequest } from "../domain/chat.ts";
 import { buildPrompt } from "../domain/chat.ts";
 import { isAdsModel } from "../domain/model.ts";
-import { CapyError } from "../domain/errors.ts";
+import { CapyError, errorText, isAbort, mapCapyCode } from "../domain/errors.ts";
 import type { JamCreated, JamDetail, JamFile } from "../ports/capy-app.ts";
 import type { CapyAppPort } from "../ports/capy-app.ts";
 import type { CapyPublicPort } from "../ports/capy-public.ts";
@@ -95,7 +95,9 @@ export class ChatUseCase {
     run.onThread?.(thread);
 
     // 状态检查失败就让请求失败，不静默跳过（否则 credits/desktop 阻塞会被掩盖）。
-    const detail = await this.options.app.getJam(jwt, session.orgId, thread.id, run.signal);
+    // 状态检查是 best-effort：失败时继续走 SSE，真正无输出时 jamFailure 会给出明确错误。
+    const detail = await this.options.app.getJam(jwt, session.orgId, thread.id, run.signal)
+      .catch(() => null);
     const blocked = askError(detail);
     if (blocked) throw blocked;
 
@@ -120,7 +122,7 @@ export class ChatUseCase {
       if (isAbort(error)) throw error;
       yield {
         type: "error",
-        error: new CapyError("upstream_unavailable", errorMessage(error), { cause: error }),
+        error: new CapyError("upstream_unavailable", errorText(error), { cause: error }),
       };
     }
   }
@@ -131,16 +133,20 @@ export class ChatUseCase {
     jamId: string,
     signal?: AbortSignal,
   ): Promise<CapyError | null> {
-    const detail = await this.options.app.getJam(jwt, orgId, jamId, signal).catch(() => null);
+    const detail = await this.options.app.getJam(jwt, orgId, jamId, signal).catch((error: unknown) => {
+      throw error instanceof CapyError
+        ? error
+        : new CapyError("upstream_unavailable", `查询 Capy 线程状态失败：${errorText(error)}`, { cause: error });
+    });
     const blocked = askError(detail);
     if (blocked) return blocked;
-    if (detail?.status !== "failed") return null;
+    if (detail.status !== "failed") return null;
     const events = await this.options.app.getJamEvents(jwt, orgId, jamId, signal).catch(() => []);
     for (const event of [...events].reverse()) {
       if (event.kind !== "error") continue;
       const code = event.payload?.code ?? "";
       const message = event.payload?.message ?? "Capy 线程失败";
-      return mapJamError(code, message);
+      return mapCapyCode(code, message);
     }
     return new CapyError("upstream_error", "Capy 线程失败，但没有返回错误详情");
   }
@@ -156,11 +162,14 @@ export class ChatUseCase {
 
   private async sessionJwt(session: AccountSession, signal?: AbortSignal): Promise<string> {
     const key = `${accountKey(session)}:${session.clerk.sessionId}`;
-    const hit = this.jwtCache.get(key);
     const now = this.options.clock.now();
-    if (hit && hit.expiresAt > now) return hit.jwt;
+    for (const [cachedKey, entry] of this.jwtCache) {
+      if (entry.expiresAt <= now) this.jwtCache.delete(cachedKey);
+    }
+    const hit = this.jwtCache.get(key);
+    if (hit) return hit.jwt;
     const jwt = await this.options.app.sessionJwt(session.clerk, signal);
-    this.jwtCache.set(key, { jwt, expiresAt: now + JWT_TTL_MS });
+    this.jwtCache.set(key, { jwt, expiresAt: this.options.clock.now() + JWT_TTL_MS });
     return jwt;
   }
 }
@@ -175,22 +184,4 @@ function askError(detail: JamDetail | null): CapyError | null {
     return new CapyError("upstream_unavailable", ask.text || "Capy 线程需要人工/桌面端操作");
   }
   return new CapyError("upstream_error", ask.text || `Capy 线程阻塞：${ask.kind}`);
-}
-
-function mapJamError(code: string, message: string): CapyError {
-  if (code === "region_unsupported") return new CapyError("region_unsupported", message, { detail: code });
-  if (code === "unauthorized") return new CapyError("sign_in_required", message, { detail: code });
-  if (code === "forbidden") return new CapyError("upstream_error", message, { status: 403, detail: code });
-  if (code === "rate_limited") return new CapyError("rate_limited", message, { detail: code });
-  if (/quota|credit/iu.test(code)) return new CapyError("insufficient_quota", message, { detail: code });
-  if (/ModelSelection/iu.test(code)) return new CapyError("model_not_found", message, { detail: code });
-  return new CapyError("upstream_error", message, { detail: code });
-}
-
-function isAbort(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

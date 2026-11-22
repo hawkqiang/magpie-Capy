@@ -73,7 +73,7 @@ function hostMatchesNoProxy(host: string, noProxy: string | undefined): boolean 
   const plain = host.toLowerCase();
   for (const rule of rules) {
     if (rule === "*") return true;
-    const value = rule.replace(/^\./u, "");
+    const value = rule.replace(/^\./u, "").replace(/^\[|\]$/gu, "");
     if (plain === value || plain.endsWith(`.${value}`)) return true;
   }
   return false;
@@ -107,7 +107,7 @@ export function createProxyFetch(
   proxyUrl: string,
   options: { readonly onWarn?: (message: string) => void } = {},
 ): typeof fetch {
-  const url = normalizeProxyUrl(proxyUrl);
+  const url = proxyUrl;
   if (!url) return baseFetch;
 
   let warned = false;
@@ -126,7 +126,7 @@ export function createProxyFetch(
         ? input.toString()
         : input.url;
     let host = "";
-    try { host = new URL(target).hostname; } catch {}
+    try { host = new URL(target).hostname.replace(/^\[|\]$/gu, ""); } catch {}
     if (host && (LOCAL_HOSTS.has(host) || hostMatchesNoProxy(host, process.env.NO_PROXY ?? process.env.no_proxy))) {
       return baseFetch(input, init);
     }
@@ -166,12 +166,9 @@ export function createProxyFetch(
       const withDispatcher = { ...init, dispatcher: undiciAgent } as RequestInit & { dispatcher: unknown };
       try {
         return await baseFetch(input, withDispatcher);
-      } catch {
-        try {
-          return await baseFetch(input, { ...init, proxy: url } as RequestInit & { proxy: string });
-        } catch {
-          // fall through to direct
-        }
+      } catch (error) {
+        warn(`代理 ${url} 请求失败，本次直连：${error instanceof Error ? error.message : String(error)}`);
+        return baseFetch(input, init);
       }
     }
 

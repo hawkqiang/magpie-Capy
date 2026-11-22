@@ -63,6 +63,37 @@ export function isAuthError(value: unknown): boolean {
   return isCapyError(value) && value.kind === "sign_in_required";
 }
 
+export function isAbort(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError");
+}
+
+export function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Capy SSE / jam events 的 error code → 领域错误。 */
+export function mapCapyCode(code: string, message: string): CapyError {
+  if (code === "region_unsupported") {
+    return new CapyError("region_unsupported", message, { detail: code });
+  }
+  if (code === "unauthorized") {
+    return new CapyError("sign_in_required", message, { detail: code });
+  }
+  if (code === "forbidden") {
+    return new CapyError("upstream_error", message, { status: 403, detail: code });
+  }
+  if (code === "rate_limited") {
+    return new CapyError("rate_limited", message, { detail: code });
+  }
+  if (/quota|credit/iu.test(code)) {
+    return new CapyError("insufficient_quota", message, { detail: code });
+  }
+  if (/ModelSelection/iu.test(code)) {
+    return new CapyError("model_not_found", message, { detail: code });
+  }
+  return new CapyError("upstream_error", message, { detail: code });
+}
+
 /** 上游 JSON / HTTP 状态 → 领域错误。 */
 export function mapUpstream(status: number, body: unknown, fallback = ""): CapyError {
   const tag = tagOf(body);
