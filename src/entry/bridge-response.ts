@@ -100,13 +100,21 @@ function recoverQuestion(request:ChatRequest,text:string,tool:ToolDefinition): {
     if (/^<system-reminder>[\s\S]*?<\/system-reminder>$/u.test(raw) || /^Time sampled while preparing turn \d+, step \d+:/u.test(raw)) continue;
     idx=i; intent=raw; break;
   }
-  if (idx<0 || /(?:不要|别|不再|无需|跳过|拒绝|skip|declin|don't|do not|never|instead of|example|quote|示例|引用|```|^>)/imu.test(intent.replace(/不要猜|do not guess|don't guess/giu,'')) ||
-      !/(?:^|[，。；：,;:\n]|\bthen\s+)(?:\s*(?:然后|请|必须|再|please\s+|must\s+|then\s+))*(?:调用|使用|call\s+|use\s+)\s*`?ask_user_question\b/iu.test(intent.replace(/不要猜/gu,''))) return {reason:'no_intent'};
+  const intentClean=intent.replace(/不要猜|do not guess|don't guess/giu,'');
+  if (idx<0 || /(?:不要|别|不再|无需|跳过|拒绝|skip|declin|don't|do not|never|instead of|example|quote|示例|引用|```|^>)/imu.test(intentClean)) return {reason:'no_intent'};
+  const namedTool=/(?:^|[，。；：,;:\n]|\bthen\s+)(?:\s*(?:然后|请|必须|再|please\s+|must\s+|then\s+))*(?:调用|使用|call\s+|use\s+)\s*`?ask_user_question\b/iu.test(intentClean);
+  const workRequest=/(?:修复|排查|定位|检查|看下|看一下|查一下|解决|处理|能否|能不能|可以.{0,4}(?:修|查|看)|fix|debug|investigate|look\s+into|diagnose|can\s+you\s+(?:fix|check|look))/iu.test(intentClean);
+  if (!namedTool && !workRequest) return {reason:'no_intent'};
   if (request.messages.slice(idx+1).some(m=>m.role==='assistant' && m.toolCalls?.some(c=>c.name===name) || m.role==='tool' && m.name===name)) return {reason:'already_asked'};
   // Only copy an existing question. Do not interpret tool output as a request, invent
   // an answer or turn an approval challenge into a question-tool permission grant.
   if (text.length>2048 || /```|<\/?(?:tool|cmd)|审批|批准|授权|权限|许可|确认执行|approval|approv|permission|authorize|password|密码|secret|密钥|token|credential/iu.test(text)) return {reason:'not_question'};
   if (/(?:^|\n)\s*>|(?:says|example|示例|引用|输出)\s*[:：]/iu.test(text)) return {reason:'not_question'};
+  // A work request only becomes a question when the reply is blocked: it says it cannot
+  // proceed without the user, or asks for specific missing input. Ordinary answers that
+  // merely contain a question mark must not be converted into a UI prompt.
+  const blocked=/can't|cannot|can not|unable to|won't be able|before i can|blocked|stuck|need (?:one|two|a few|more) (?:thing|things|piece|information|detail)|需要(?:你|您)(?:提供|告诉|确认|回答)|无法(?:继续|确定|判断|修复|定位)|才能(?:继续|修复|确定|判断)|缺少|不确定/iu.test(text);
+  if (!namedTool && !blocked) return {reason:'not_question'};
   const clean=text.replace(/`[^`]*`/gu,'').replace(/（[^）]*）/gu,'').replace(/\s+/gu,' ').trim();
   const parts=clean.split(/(?<=[。！？.!?])\s*|\n+|[—–]+|\s+and\s+(?=now need\b)|[，,；;]\s*/iu).map(p=>p.trim()).filter(Boolean);
   const trigger=/请(?:你)?(?:先|直接)?(?:告诉我|告知|提供|输入)|需要你(?:先|直接)?(?:告诉我|告知|确认|提供)|(?:I\s+)?(?:now\s+)?need\s+(?:your|the)\b|(?:please\s+)?(?:tell me|provide|choose|which|what|could you tell me|can you provide)\b/iu;

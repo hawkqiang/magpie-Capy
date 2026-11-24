@@ -992,13 +992,21 @@ function recoverQuestion(request, text, tool) {
     intent = raw;
     break;
   }
-  if (idx < 0 || /(?:\u4E0D\u8981|\u522B|\u4E0D\u518D|\u65E0\u9700|\u8DF3\u8FC7|\u62D2\u7EDD|skip|declin|don't|do not|never|instead of|example|quote|\u793A\u4F8B|\u5F15\u7528|```|^>)/imu.test(intent.replace(/\u4E0D\u8981\u731C|do not guess|don't guess/giu, "")) || !/(?:^|[\uFF0C\u3002\uFF1B\uFF1A,;:\n]|\bthen\s+)(?:\s*(?:\u7136\u540E|\u8BF7|\u5FC5\u987B|\u518D|please\s+|must\s+|then\s+))*(?:\u8C03\u7528|\u4F7F\u7528|call\s+|use\s+)\s*`?ask_user_question\b/iu.test(intent.replace(/\u4E0D\u8981\u731C/gu, "")))
+  const intentClean = intent.replace(/\u4E0D\u8981\u731C|do not guess|don't guess/giu, "");
+  if (idx < 0 || /(?:\u4E0D\u8981|\u522B|\u4E0D\u518D|\u65E0\u9700|\u8DF3\u8FC7|\u62D2\u7EDD|skip|declin|don't|do not|never|instead of|example|quote|\u793A\u4F8B|\u5F15\u7528|```|^>)/imu.test(intentClean))
+    return { reason: "no_intent" };
+  const namedTool = /(?:^|[\uFF0C\u3002\uFF1B\uFF1A,;:\n]|\bthen\s+)(?:\s*(?:\u7136\u540E|\u8BF7|\u5FC5\u987B|\u518D|please\s+|must\s+|then\s+))*(?:\u8C03\u7528|\u4F7F\u7528|call\s+|use\s+)\s*`?ask_user_question\b/iu.test(intentClean);
+  const workRequest = /(?:\u4FEE\u590D|\u6392\u67E5|\u5B9A\u4F4D|\u68C0\u67E5|\u770B\u4E0B|\u770B\u4E00\u4E0B|\u67E5\u4E00\u4E0B|\u89E3\u51B3|\u5904\u7406|\u80FD\u5426|\u80FD\u4E0D\u80FD|\u53EF\u4EE5.{0,4}(?:\u4FEE|\u67E5|\u770B)|fix|debug|investigate|look\s+into|diagnose|can\s+you\s+(?:fix|check|look))/iu.test(intentClean);
+  if (!namedTool && !workRequest)
     return { reason: "no_intent" };
   if (request.messages.slice(idx + 1).some((m) => m.role === "assistant" && m.toolCalls?.some((c) => c.name === name) || m.role === "tool" && m.name === name))
     return { reason: "already_asked" };
   if (text.length > 2048 || /```|<\/?(?:tool|cmd)|\u5BA1\u6279|\u6279\u51C6|\u6388\u6743|\u6743\u9650|\u8BB8\u53EF|\u786E\u8BA4\u6267\u884C|approval|approv|permission|authorize|password|\u5BC6\u7801|secret|\u5BC6\u94A5|token|credential/iu.test(text))
     return { reason: "not_question" };
   if (/(?:^|\n)\s*>|(?:says|example|\u793A\u4F8B|\u5F15\u7528|\u8F93\u51FA)\s*[:\uFF1A]/iu.test(text))
+    return { reason: "not_question" };
+  const blocked = /can't|cannot|can not|unable to|won't be able|before i can|blocked|stuck|need (?:one|two|a few|more) (?:thing|things|piece|information|detail)|\u9700\u8981(?:\u4F60|\u60A8)(?:\u63D0\u4F9B|\u544A\u8BC9|\u786E\u8BA4|\u56DE\u7B54)|\u65E0\u6CD5(?:\u7EE7\u7EED|\u786E\u5B9A|\u5224\u65AD|\u4FEE\u590D|\u5B9A\u4F4D)|\u624D\u80FD(?:\u7EE7\u7EED|\u4FEE\u590D|\u786E\u5B9A|\u5224\u65AD)|\u7F3A\u5C11|\u4E0D\u786E\u5B9A/iu.test(text);
+  if (!namedTool && !blocked)
     return { reason: "not_question" };
   const clean = text.replace(/`[^`]*`/gu, "").replace(/\uFF08[^\uFF09]*\uFF09/gu, "").replace(/\s+/gu, " ").trim();
   const parts = clean.split(/(?<=[\u3002\uFF01\uFF1F.!?])\s*|\n+|[\u2014\u2013]+|\s+and\s+(?=now need\b)|[\uFF0C,\uFF1B;]\s*/iu).map((p) => p.trim()).filter(Boolean);

@@ -27,6 +27,14 @@ test('exact two observed fallback phrasings', async()=>{
   const english=await probe([intent],'I need the one thing I won\'t guess: what\'s this session\'s codename?');
   expect(english.choice.finish_reason).toBe('tool_calls');
 });
+test('blocking clarification in a real work request opens the question UI',async()=>{
+  const work=user('我发现deepseek harness调用codex里的openai的模型也出现被突然打断的情况，你能修复一下么');
+  const stopping='I can\'t reach the code that handles this yet, so I need one thing from you before I can fix it. Two things would unblock me: 1. Where the real source is. Tell me the folder and I\'ll go straight at it.';
+  const r=await probe([work],stopping);
+  expect(r.choice.finish_reason).toBe('tool_calls');
+  expect(r.outcome?.clarification).toBe('adapted');
+  for(const plain of ['summarize','你好','Done.']) expect((await probe([user(plain)],stopping)).choice.finish_reason).toBe('stop');
+});
 test('imperative English question, explicit named choice',async()=>{
   const r=await probe([user('Use ask_user_question to ask me for the code.')],'Tell me what the codename is.',{type:'function',function:{name}});
   expect(r.choice.finish_reason).toBe('tool_calls');
