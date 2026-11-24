@@ -116,6 +116,11 @@ export function cmdInstruction(tools: readonly ToolDefinition[], forced: string 
     lines.push('To call a client-only tool (or any tool with multiple JSON arguments), reply with:');
     lines.push('<TOOL_CALL>{"name":"<tool_name>","arguments":{...}}</TOOL_CALL>');
   }
+  if (names.has('ask_user_question') && (!forced || forced === 'ask_user_question')) {
+    lines.push('When you need an answer from the user, plain text ends this run without opening the question UI. Output the following tool packet as your entire reply, replacing the example question with your actual question:');
+    lines.push('<TOOL_CALL>{"name":"ask_user_question","arguments":{"questions":[{"id":"clarify","question":"Which option should I use?"}]}}</TOOL_CALL>');
+    lines.push('Once a tool result supplies the answer, use it; do not ask again.');
+  }
   lines.push('For a single shell command you may also use <CMD>command</CMD>. Do not fabricate tool outputs.');
   if (forced) {
     const target = tools.find((t) => t.function.name === forced);

@@ -632,6 +632,11 @@ function cmdInstruction(tools, forced, required) {
     lines.push("To call a client-only tool (or any tool with multiple JSON arguments), reply with:");
     lines.push('<TOOL_CALL>{"name":"<tool_name>","arguments":{...}}</TOOL_CALL>');
   }
+  if (names.has("ask_user_question") && (!forced || forced === "ask_user_question")) {
+    lines.push("When you need an answer from the user, plain text ends this run without opening the question UI. Output the following tool packet as your entire reply, replacing the example question with your actual question:");
+    lines.push('<TOOL_CALL>{"name":"ask_user_question","arguments":{"questions":[{"id":"clarify","question":"Which option should I use?"}]}}</TOOL_CALL>');
+    lines.push("Once a tool result supplies the answer, use it; do not ask again.");
+  }
   lines.push("For a single shell command you may also use <CMD>command</CMD>. Do not fabricate tool outputs.");
   if (forced) {
     const target = tools.find((t) => t.function.name === forced);
@@ -920,8 +925,22 @@ async function bridgeResponse(request, events, meta, bridge, nextId, onOutcome, 
   const parsed = reply.committed ? bridge.parse(reply.text, tools, request.toolChoice) : null;
   const fromBuffer = reply.committed ? capturedCalls(tools, request.toolChoice, getJamId?.()) : null;
   const fromCapture = !parsed && reply.committed ? reply.capturedCalls && reply.capturedCalls.length > 0 ? [...reply.capturedCalls] : fromBuffer : null;
-  const calls = parsed?.calls ?? fromCapture;
-  onOutcome?.({ committed: reply.committed, internalTools: reply.internalTools, calls: calls?.length ?? 0 });
+  let calls = parsed?.calls ?? fromCapture;
+  const questionTool = tools.find((t) => t.function.name === "ask_user_question");
+  let clarification;
+  if (questionTool) {
+    if (calls?.length)
+      clarification = "existing_call";
+    else if (!reply.committed)
+      clarification = "uncommitted";
+    else {
+      const result = recoverQuestion(request, reply.text, questionTool);
+      clarification = result.reason;
+      if (result.call)
+        calls = [result.call];
+    }
+  }
+  onOutcome?.({ committed: reply.committed, internalTools: reply.internalTools, calls: calls?.length ?? 0, ...clarification ? { clarification } : {} });
   if (calls && calls.length > 0) {
     const out = calls.map((call) => ({ ...call, id: nextId() }));
     return request.stream ? encodeToolCallStream(meta, out) : encodeToolCallCompletion(meta, out);
@@ -930,6 +949,63 @@ async function bridgeResponse(request, events, meta, bridge, nextId, onOutcome, 
     throw new CapyError("upstream_error", reply.committed ? reply.internalTools ? "\u4E0A\u6E38 agent \u7528\u4E86\u81EA\u5DF1\u7684\u5185\u90E8\u5DE5\u5177\uFF0C\u6CA1\u6709\u8FD4\u56DE\u53EF\u8F6C\u4EA4\u7684 <CMD> \u6216 Machine RPC \u547D\u4EE4" : "\u6A21\u578B\u672A\u8FD4\u56DE\u6EE1\u8DB3 tool_choice \u7684 <CMD> \u8C03\u7528" : "\u4E0A\u6E38\u6CA1\u6709\u63D0\u4EA4\u5B8C\u6574\u56DE\u590D\uFF0C\u4E0D\u80FD\u4ECE\u4E2D\u63D0\u53D6\u8C03\u7528");
   }
   return request.stream ? encodeChatStream(textEvents(reply.text), meta) : encodeCompletion(meta.id, meta.model, meta.created, reply.text);
+}
+function fits(value, node) {
+  if (!node || typeof node !== "object" || Array.isArray(node))
+    return false;
+  const s = node;
+  const common = ["type", "description", "title", "default", "$schema"];
+  const extras = s.type === "object" ? ["properties", "required", "additionalProperties"] : s.type === "array" ? ["items", "minItems", "maxItems"] : ["minLength", "maxLength"];
+  if (Object.keys(s).some((k) => ![...common, ...extras].includes(k)))
+    return false;
+  if (s.type === "object" && value && typeof value === "object" && !Array.isArray(value)) {
+    if (s.additionalProperties !== undefined && typeof s.additionalProperties !== "boolean")
+      return false;
+    if (s.required !== undefined && (!Array.isArray(s.required) || !s.required.every((k) => typeof k === "string" && Object.hasOwn(value, k))))
+      return false;
+    const props = s.properties;
+    return !!props && Object.entries(value).every(([k, v]) => Object.hasOwn(props, k) && fits(v, props[k]));
+  }
+  if (s.type === "array" && Array.isArray(value))
+    return bounds(value.length, s.minItems, s.maxItems) && value.every((v) => fits(v, s.items));
+  return s.type === "string" && typeof value === "string" && bounds([...value].length, s.minLength, s.maxLength);
+}
+function bounds(n, min, max) {
+  return (min === undefined || typeof min === "number" && n >= min) && (max === undefined || typeof max === "number" && n <= max);
+}
+function recoverQuestion(request, text, tool) {
+  const choice = request.toolChoice, name = "ask_user_question";
+  const named = choice?.function?.name;
+  if (choice != null && choice !== "auto" && choice !== "required" && named !== name)
+    return { reason: "choice_excluded" };
+  let idx = -1, intent = "";
+  for (let i = request.messages.length - 1;i >= 0; i--) {
+    const msg = request.messages[i];
+    if (msg?.role !== "user")
+      continue;
+    const c = msg.content;
+    const raw = (typeof c === "string" ? c : c?.flatMap((p) => ("text" in p) ? [p.text] : []).join(`
+`))?.trim() ?? "";
+    if (/^<system-reminder>[\s\S]*?<\/system-reminder>$/u.test(raw) || /^Time sampled while preparing turn \d+, step \d+:/u.test(raw))
+      continue;
+    idx = i;
+    intent = raw;
+    break;
+  }
+  if (idx < 0 || /(?:\u4E0D\u8981|\u522B|\u4E0D\u518D|\u65E0\u9700|\u8DF3\u8FC7|\u62D2\u7EDD|skip|declin|don't|do not|never|instead of|example|quote|\u793A\u4F8B|\u5F15\u7528|```|^>)/imu.test(intent.replace(/\u4E0D\u8981\u731C|do not guess|don't guess/giu, "")) || !/(?:^|[\uFF0C\u3002\uFF1B\uFF1A,;:\n]|\bthen\s+)(?:\s*(?:\u7136\u540E|\u8BF7|\u5FC5\u987B|\u518D|please\s+|must\s+|then\s+))*(?:\u8C03\u7528|\u4F7F\u7528|call\s+|use\s+)\s*`?ask_user_question\b/iu.test(intent.replace(/\u4E0D\u8981\u731C/gu, "")))
+    return { reason: "no_intent" };
+  if (request.messages.slice(idx + 1).some((m) => m.role === "assistant" && m.toolCalls?.some((c) => c.name === name) || m.role === "tool" && m.name === name))
+    return { reason: "already_asked" };
+  if (text.length > 2048 || /```|<\/?(?:tool|cmd)|\u5BA1\u6279|\u6279\u51C6|\u6388\u6743|\u6743\u9650|\u8BB8\u53EF|\u786E\u8BA4\u6267\u884C|approval|approv|permission|authorize|password|\u5BC6\u7801|secret|\u5BC6\u94A5|token|credential/iu.test(text))
+    return { reason: "not_question" };
+  const parts = text.trim().split(/(?<=[\u3002\uFF01\uFF1F.!?])\s*|\n+|\s+[\u2014\u2013]\s+|\s+and\s+(?=now need\b)|[\uFF0C,]\s*/iu).map((p) => p.trim());
+  const questions = parts.filter((p) => /^(?:\u8BF7(?:\u4F60)?(?:\u5148)?(?:\u544A\u8BC9\u6211|\u63D0\u4F9B|\u9009\u62E9|\u8F93\u5165)|(?:\u73B0\u5728)?\u9700\u8981\u4F60(?:\u5148|\u76F4\u63A5)?(?:\u544A\u8BC9\u6211|\u63D0\u4F9B|\u9009\u62E9)|(?:\u672C\u6B21|\u8FD9\u6B21|\u4F60\u7684|\u60A8|\u4F60|\u8BF7\u95EE|\u54EA|\u4EC0\u4E48|\u662F\u5426)[^<>`"\u201C\u201D]*[\uFF1F?]$|(?:(?:I\s+)?(?:now\s+)?need\s+(?:your|the)\s+|(?:please\s+)?(?:tell me|provide|choose|which|what|could you tell me|can you provide)\b))/iu.test(p));
+  if (questions.length !== 1 || /[<>`"\u201C\u201D]/u.test(questions[0]) || /(?:^|\n)\s*>|(?:says|example|\u793A\u4F8B|\u5F15\u7528|\u8F93\u51FA)\s*[:\uFF1A]/iu.test(text))
+    return { reason: "not_question" };
+  const args = { questions: [{ id: "clarify", question: questions[0] }] };
+  if (!fits(args, tool.function.parameters))
+    return { reason: "unsupported_schema" };
+  return { reason: "adapted", call: { name, arguments: JSON.stringify(args) } };
 }
 function capturedCalls(tools, toolChoice, jamId) {
   const drained = drainInvocations(jamId || undefined);
