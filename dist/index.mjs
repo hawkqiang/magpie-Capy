@@ -3945,8 +3945,18 @@ ${systems.join(`
   blocks.push("</conversation>");
   const last = turns[turns.length - 1];
   blocks.push(last?.role === "assistant" ? "Continue the last assistant message." : last?.role === "tool" ? "Continue using the tool result above." : "Reply to the last user message.");
-  if (toolInstruction.length > 0)
+  if (toolInstruction.length > 0) {
     blocks.push(toolInstruction);
+    if (last?.role === "tool") {
+      blocks.push("A plan alone ends the client turn. If the requested work is unfinished and the next action is authorized, issue the next declared tool call now instead of announcing it. If finished, answer normally. For an authorized action subject to host approval, emit its declared tool call so the client can pause for review and resume with the actual result. If you need user input and ask_user_question is declared, call it and wait for its answer rather than ending with prose. A user answer does not override a host denial. Never resubmit a denied action; continue with permitted alternatives, or report a blocker if none exists.");
+      const recent = turns.slice(-4);
+      const [a, ar, b, br] = recent;
+      const x = a?.toolCalls?.[0], y = b?.toolCalls?.[0];
+      if (a?.toolCalls?.length === 1 && b?.toolCalls?.length === 1 && x?.name === "read" && y?.name === "read" && x.arguments === y.arguments && ar?.role === "tool" && br?.role === "tool" && ar.toolCallId === x.id && br.toolCallId === y.id && ar.text === br.text) {
+        blocks.push("The same read already returned the same result twice. Use that result to advance the task; repeat it only if the file has changed.");
+      }
+    }
+  }
   return blocks.join(`
 
 `);
