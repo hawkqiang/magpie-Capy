@@ -106,10 +106,20 @@ function recoverQuestion(request:ChatRequest,text:string,tool:ToolDefinition): {
   // Only copy an existing question. Do not interpret tool output as a request, invent
   // an answer or turn an approval challenge into a question-tool permission grant.
   if (text.length>2048 || /```|<\/?(?:tool|cmd)|审批|批准|授权|权限|许可|确认执行|approval|approv|permission|authorize|password|密码|secret|密钥|token|credential/iu.test(text)) return {reason:'not_question'};
-  const parts=text.trim().split(/(?<=[。！？.!?])\s*|\n+|\s+[—–]\s+|\s+and\s+(?=now need\b)|[，,]\s*/iu).map(p=>p.trim());
-  const questions=parts.filter(p => /^(?:请(?:你)?(?:先)?(?:告诉我|提供|选择|输入)|(?:现在)?需要你(?:先|直接)?(?:告诉我|提供|选择)|(?:本次|这次|你的|您|你|请问|哪|什么|是否)[^<>`"“”]*[？?]$|(?:(?:I\s+)?(?:now\s+)?need\s+(?:your|the)\s+|(?:please\s+)?(?:tell me|provide|choose|which|what|could you tell me|can you provide)\b))/iu.test(p));
-  if (questions.length!==1 || /[<>`"“”]/u.test(questions[0]!) || /(?:^|\n)\s*>|(?:says|example|示例|引用|输出)\s*[:：]/iu.test(text)) return {reason:'not_question'};
-  const args={questions:[{id:'clarify',question:questions[0]!}]};
+  if (/(?:^|\n)\s*>|(?:says|example|示例|引用|输出)\s*[:：]/iu.test(text)) return {reason:'not_question'};
+  const clean=text.replace(/`[^`]*`/gu,'').replace(/（[^）]*）/gu,'').replace(/\s+/gu,' ').trim();
+  const parts=clean.split(/(?<=[。！？.!?])\s*|\n+|[—–]+|\s+and\s+(?=now need\b)|[，,；;]\s*/iu).map(p=>p.trim()).filter(Boolean);
+  const trigger=/请(?:你)?(?:先|直接)?(?:告诉我|告知|提供|输入)|需要你(?:先|直接)?(?:告诉我|告知|确认|提供)|(?:I\s+)?(?:now\s+)?need\s+(?:your|the)\b|(?:please\s+)?(?:tell me|provide|choose|which|what|could you tell me|can you provide)\b/iu;
+  const precise=parts.flatMap(p => {
+    const at=p.match(trigger)?.index;
+    return at!==undefined ? [p.slice(at)] : (/[？?]$/u.test(p) ? [p] : []);
+  });
+  // Fallback: when phrasing varies, ask with the model's own request text rather than
+  // ending the run. Only when it clearly asks the user, never a summary or approval.
+  const asksUser=/请|需要你|我需要|告知|告诉|提供|确认|输入|选择|请问|哪|什么|是否|\?|？|\bneed\b|\btell me\b|\bprovide\b|\bwhich\b|\bwhat\b|\bcould you\b|\bcan you\b/iu.test(clean);
+  const question = precise.length===1 ? precise[0]! : (precise.length===0 && asksUser ? clean : undefined);
+  if (!question || !question.trim() || /[<>`"“”]/u.test(question)) return {reason:'not_question'};
+  const args={questions:[{id:'clarify',question}]};
   if (!fits(args,tool.function.parameters)) return {reason:'unsupported_schema'};
   return {reason:'adapted',call:{name,arguments:JSON.stringify(args)}};
 }

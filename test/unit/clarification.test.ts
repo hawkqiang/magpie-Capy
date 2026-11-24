@@ -23,7 +23,9 @@ test('committed actual question, declared schema, explicit human intent survives
   expect(r.outcome?.clarification).toBe('adapted');
 });
 test('exact two observed fallback phrasings', async()=>{
-  for (const text of ['我已读取测试标记（marker: clarification test fixture）。按要求我不猜代号，需要你直接告诉我本次代号，收到后我回复 `OK:代号`。','现在需要你告诉我本次代号，我不会猜。']) expect((await probe([intent],text)).choice.finish_reason).toBe('tool_calls');
+  for (const text of ['我已读取测试标记（marker: clarification test fixture）。按要求我不猜代号，需要你直接告诉我本次代号，收到后我回复 `OK:代号`。','现在需要你告诉我本次代号，我不会猜。','已读取测试标记（marker: clarification test fixture）。按验收要求，我不猜代号——请告诉我本次代号，收到后我回复 `OK:代号`。','测试标记已读取：`marker: clarification test fixture`。\n\n按流程，我需要向你确认本次代号，不会猜测。请告知本次代号，收到后我会回复 `OK:代号`。']) expect((await probe([intent],text)).choice.finish_reason).toBe('tool_calls');
+  const english=await probe([intent],'I need the one thing I won\'t guess: what\'s this session\'s codename?');
+  expect(english.choice.finish_reason).toBe('tool_calls');
 });
 test('imperative English question, explicit named choice',async()=>{
   const r=await probe([user('Use ask_user_question to ask me for the code.')],'Tell me what the codename is.',{type:'function',function:{name}});

@@ -998,11 +998,20 @@ function recoverQuestion(request, text, tool) {
     return { reason: "already_asked" };
   if (text.length > 2048 || /```|<\/?(?:tool|cmd)|\u5BA1\u6279|\u6279\u51C6|\u6388\u6743|\u6743\u9650|\u8BB8\u53EF|\u786E\u8BA4\u6267\u884C|approval|approv|permission|authorize|password|\u5BC6\u7801|secret|\u5BC6\u94A5|token|credential/iu.test(text))
     return { reason: "not_question" };
-  const parts = text.trim().split(/(?<=[\u3002\uFF01\uFF1F.!?])\s*|\n+|\s+[\u2014\u2013]\s+|\s+and\s+(?=now need\b)|[\uFF0C,]\s*/iu).map((p) => p.trim());
-  const questions = parts.filter((p) => /^(?:\u8BF7(?:\u4F60)?(?:\u5148)?(?:\u544A\u8BC9\u6211|\u63D0\u4F9B|\u9009\u62E9|\u8F93\u5165)|(?:\u73B0\u5728)?\u9700\u8981\u4F60(?:\u5148|\u76F4\u63A5)?(?:\u544A\u8BC9\u6211|\u63D0\u4F9B|\u9009\u62E9)|(?:\u672C\u6B21|\u8FD9\u6B21|\u4F60\u7684|\u60A8|\u4F60|\u8BF7\u95EE|\u54EA|\u4EC0\u4E48|\u662F\u5426)[^<>`"\u201C\u201D]*[\uFF1F?]$|(?:(?:I\s+)?(?:now\s+)?need\s+(?:your|the)\s+|(?:please\s+)?(?:tell me|provide|choose|which|what|could you tell me|can you provide)\b))/iu.test(p));
-  if (questions.length !== 1 || /[<>`"\u201C\u201D]/u.test(questions[0]) || /(?:^|\n)\s*>|(?:says|example|\u793A\u4F8B|\u5F15\u7528|\u8F93\u51FA)\s*[:\uFF1A]/iu.test(text))
+  if (/(?:^|\n)\s*>|(?:says|example|\u793A\u4F8B|\u5F15\u7528|\u8F93\u51FA)\s*[:\uFF1A]/iu.test(text))
     return { reason: "not_question" };
-  const args = { questions: [{ id: "clarify", question: questions[0] }] };
+  const clean = text.replace(/`[^`]*`/gu, "").replace(/\uFF08[^\uFF09]*\uFF09/gu, "").replace(/\s+/gu, " ").trim();
+  const parts = clean.split(/(?<=[\u3002\uFF01\uFF1F.!?])\s*|\n+|[\u2014\u2013]+|\s+and\s+(?=now need\b)|[\uFF0C,\uFF1B;]\s*/iu).map((p) => p.trim()).filter(Boolean);
+  const trigger = /\u8BF7(?:\u4F60)?(?:\u5148|\u76F4\u63A5)?(?:\u544A\u8BC9\u6211|\u544A\u77E5|\u63D0\u4F9B|\u8F93\u5165)|\u9700\u8981\u4F60(?:\u5148|\u76F4\u63A5)?(?:\u544A\u8BC9\u6211|\u544A\u77E5|\u786E\u8BA4|\u63D0\u4F9B)|(?:I\s+)?(?:now\s+)?need\s+(?:your|the)\b|(?:please\s+)?(?:tell me|provide|choose|which|what|could you tell me|can you provide)\b/iu;
+  const precise = parts.flatMap((p) => {
+    const at = p.match(trigger)?.index;
+    return at !== undefined ? [p.slice(at)] : /[\uFF1F?]$/u.test(p) ? [p] : [];
+  });
+  const asksUser = /\u8BF7|\u9700\u8981\u4F60|\u6211\u9700\u8981|\u544A\u77E5|\u544A\u8BC9|\u63D0\u4F9B|\u786E\u8BA4|\u8F93\u5165|\u9009\u62E9|\u8BF7\u95EE|\u54EA|\u4EC0\u4E48|\u662F\u5426|\?|\uFF1F|\bneed\b|\btell me\b|\bprovide\b|\bwhich\b|\bwhat\b|\bcould you\b|\bcan you\b/iu.test(clean);
+  const question = precise.length === 1 ? precise[0] : precise.length === 0 && asksUser ? clean : undefined;
+  if (!question || !question.trim() || /[<>`"\u201C\u201D]/u.test(question))
+    return { reason: "not_question" };
+  const args = { questions: [{ id: "clarify", question }] };
   if (!fits(args, tool.function.parameters))
     return { reason: "unsupported_schema" };
   return { reason: "adapted", call: { name, arguments: JSON.stringify(args) } };
