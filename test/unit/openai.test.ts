@@ -6,6 +6,8 @@ import { CapyError } from "../../src/domain/errors.ts";
 import {
   encodeChatStream,
   encodeErrorResponse,
+  encodeToolCallCompletion,
+  encodeToolCallStream,
   parseChatRequest,
 } from "../../src/protocol/openai.ts";
 
@@ -131,4 +133,59 @@ test("encodeErrorResponse：401 带 sign-in header", async () => {
   expect(response.headers.get("x-magpie-sign-in")).toBe("expired");
   const body = await response.json() as { error: { code: string } };
   expect(body.error.code).toBe("sign_in_required");
+});
+
+test("parseChatRequest：tools/tool_choice 为 null 按未提供处理", () => {
+  const request = parseChatRequest({ model: "m", messages: [{ role: "user", content: "x" }], tools: null, tool_choice: null });
+  expect(request.tools).toBeUndefined();
+  expect(request.toolChoice).toBeUndefined();
+});
+
+test("parseChatRequest：工具名重复 / 强制未声明工具 / required 无工具 → 拒绝", () => {
+  const tool = { type: "function", function: { name: "a" } };
+  expect(() => parseChatRequest({
+    model: "m",
+    messages: [{ role: "user", content: "x" }],
+    tools: [tool, tool],
+  })).toThrow(CapyError);
+  expect(() => parseChatRequest({
+    model: "m",
+    messages: [{ role: "user", content: "x" }],
+    tools: [tool],
+    tool_choice: { type: "function", function: { name: "b" } },
+  })).toThrow(CapyError);
+  expect(() => parseChatRequest({
+    model: "m",
+    messages: [{ role: "user", content: "x" }],
+    tools: [],
+    tool_choice: "required",
+  })).toThrow(CapyError);
+});
+
+test("encodeToolCallCompletion：tool_calls / tool_call_id / finish_reason", async () => {
+  const response = encodeToolCallCompletion({ id: "c1", model: "m", created: 1 }, [
+    { id: "call_1", name: "bash", arguments: "{\"command\":\"pwd\"}" },
+  ]);
+  const body = await response.json() as {
+    choices: { message: { content: null; tool_calls: { id: string; type: string; function: { name: string; arguments: string } }[] }; finish_reason: string }[];
+  };
+  expect(body.choices[0]?.message.content).toBeNull();
+  expect(body.choices[0]?.message.tool_calls[0]).toEqual({
+    id: "call_1",
+    type: "function",
+    function: { name: "bash", arguments: "{\"command\":\"pwd\"}" },
+  });
+  expect(body.choices[0]?.finish_reason).toBe("tool_calls");
+  expect((body as { usage?: unknown }).usage).toEqual({ prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+});
+
+test("encodeToolCallStream：delta.tool_calls / finish_reason / [DONE]", async () => {
+  const response = encodeToolCallStream({ id: "c1", model: "m", created: 1 }, [
+    { id: "call_1", name: "bash", arguments: "{\"command\":\"pwd\"}" },
+  ]);
+  const text = await response.text();
+  expect(text).toContain("\"delta\":{\"role\":\"assistant\",\"content\":null}");
+  expect(text).toContain("\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\"");
+  expect(text).toContain("\"finish_reason\":\"tool_calls\"");
+  expect(text.endsWith("data: [DONE]\n\n")).toBe(true);
 });

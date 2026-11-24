@@ -1,10 +1,12 @@
 import { expect, test } from "bun:test";
 
 import { ChatUseCase } from "../../src/application/chat.ts";
+import { captureInvocation } from "../../src/application/capture.ts";
 import { DeviceUseCase } from "../../src/application/device.ts";
 import { PromptToolBridge } from "../../src/application/tools.ts";
 import type { AccountSession } from "../../src/domain/account.ts";
-import type { ChatRequest } from "../../src/domain/chat.ts";
+import { buildPrompt } from "../../src/domain/chat.ts";
+import type { ChatMessage, ChatRequest } from "../../src/domain/chat.ts";
 import type { CapyAppPort, CreateJamInput, DeviceInfo, JamCreated } from "../../src/ports/capy-app.ts";
 import type { CapyPublicPort, UpstreamSseFrame } from "../../src/ports/capy-public.ts";
 import type { DeviceRuntimePort } from "../../src/ports/device-runtime.ts";
@@ -64,12 +66,13 @@ function fakeApp() {
   return { app, calls, interrupted: () => interrupted };
 }
 
-function fakePublic(frames: UpstreamSseFrame[]): CapyPublicPort {
+function fakePublic(frames: UpstreamSseFrame[], onMessage?: (text: string) => void): CapyPublicPort {
   return {
     async listModels() { return { items: [] }; },
     async *streamThread() {
       for (const frame of frames) yield frame;
     },
+    async sendMessage(_apiKey, _threadId, text) { onMessage?.(text); },
     async uploadFiles() { return []; },
     async usage() { return {}; },
     async balance() { return {}; },
@@ -118,7 +121,7 @@ test("ChatUseCase：ensure → createJam → SSE → 事件", async () => {
   expect(events).toEqual([
     { type: "delta", text: "po" },
     { type: "delta", text: "ng" },
-    { type: "final", text: "pong" },
+    { type: "final", text: "pong", committed: true },
     { type: "done" },
   ]);
   expect(calls).toHaveLength(1);
@@ -216,4 +219,133 @@ test("ChatUseCase：getJam 失败返回明确错误，不返回空完成", async
   if (events[0]?.type === "error") {
     expect(events[0].error.kind).toBe("upstream_unavailable");
   }
+});
+
+test("buildPrompt：普通单轮文本保持现有行为", () => {
+  expect(buildPrompt([{ role: "user", content: "  ping  " }])).toBe("ping");
+  expect(buildPrompt([
+    { role: "system", content: "be terse" },
+    { role: "user", content: " hi " },
+  ])).toBe("<system>\nbe terse\n</system>\n\n<user>\nhi\n</user>");
+});
+
+test("buildPrompt：多轮工具调用保留调用 ID、工具名、原始参数与结果原文", () => {
+  const messages: ChatMessage[] = [
+    { role: "user", content: "run one" },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "call_1", name: "one", arguments: '{"x": 2}' }],
+    },
+    { role: "tool", name: "one", toolCallId: "call_1", content: "  hi\n there  " },
+  ];
+  const prompt = buildPrompt(messages);
+  expect(prompt.match(/call_1/g)?.length).toBe(2);
+  expect(prompt).toContain('id="call_1" name="one"');
+  expect(prompt).toContain('{"x": 2}');
+  expect(prompt).toContain("  hi\n there  ");
+  expect(prompt).not.toContain("[调用工具");
+  expect(prompt).not.toContain("(无输出)");
+});
+
+test("buildPrompt：tool 结果按调用 ID 绑定原调用名，name 缺失也不丢结果", () => {
+  const prompt = buildPrompt([
+    { role: "user", content: "two" },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        { id: "call_a", name: "alpha", arguments: '{"a":1}' },
+        { id: "call_b", name: "beta", arguments: '{"b":2}' },
+      ],
+    },
+    { role: "tool", toolCallId: "call_b", content: "B-Result" },
+    { role: "tool", toolCallId: "call_a", content: "A-Result" },
+  ]);
+  expect(prompt.match(/call_a/g)?.length).toBe(2);
+  expect(prompt.match(/call_b/g)?.length).toBe(2);
+  expect(prompt).toContain('<tool_result id="call_a" name="alpha">\nA-Result\n</tool_result>');
+  expect(prompt).toContain('<tool_result id="call_b" name="beta">\nB-Result\n</tool_result>');
+  expect(prompt).toContain('{"a":1}');
+  expect(prompt).toContain('{"b":2}');
+});
+
+test("buildPrompt：空白工具结果原样保留，不改写成结论", () => {
+  const prompt = buildPrompt([
+    { role: "user", content: "q" },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "call_x", name: "t", arguments: "{}" }],
+    },
+    { role: "tool", toolCallId: "call_x", content: "   " },
+  ]);
+  expect(prompt).toContain('<tool_result id="call_x" name="t">\n   \n</tool_result>');
+  expect(prompt).not.toContain("(无输出)");
+});
+
+test("ChatUseCase：toolsEnabled 且收到同 jamId 的合法 RPC 时立即短路并 interruptJam", async () => {
+  const { app, interrupted } = fakeApp();
+  let streamAborted = false;
+  const publicApi: CapyPublicPort = {
+    async listModels() { return { items: [] }; },
+    async *streamThread(_apiKey, threadId, signal) {
+      // 先来一条纯 preamble 初始化（必须忽略，不触发短路）
+      captureInvocation("bash", { command: "__capy_co_author=\"\"\nunset __capy_co_author" }, threadId);
+      yield sse("assistant", { callId: "c1", text: "checking..." });
+      // 再来一条真实 read RPC（必须立即短路并中止 SSE）
+      captureInvocation("read", { path: "foo.ts", offset: 2, limit: 5 }, threadId);
+      if (signal?.aborted) {
+        streamAborted = true;
+        throw new DOMException("Aborted", "AbortError");
+      }
+      yield sse("done", {});
+    },
+    async sendMessage() {},
+    async uploadFiles() { return []; },
+    async usage() { return {}; },
+    async balance() { return {}; },
+  };
+  const useCase = new ChatUseCase({
+    app,
+    publicApi,
+    device: new DeviceUseCase(fakeRuntime()),
+    ids: ids(),
+    clock,
+    tools: new PromptToolBridge(),
+    toolsEnabled: true,
+  });
+
+  const events = [];
+  for await (const event of useCase.stream(session, {
+    ...request,
+    tools: [{
+      type: "function",
+      function: {
+        name: "read",
+        parameters: {
+          type: "object",
+          properties: { file_path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } },
+          required: ["file_path"],
+        },
+      },
+    }],
+    toolChoice: "auto",
+  })) {
+    events.push(event);
+  }
+
+  expect(streamAborted).toBe(true);
+  expect(interrupted()).toBe(1);
+  expect(events.at(-2)).toEqual({
+    type: "final",
+    text: "",
+    committed: true,
+    internalTools: true,
+    capturedCalls: [{
+      name: "read",
+      arguments: JSON.stringify({ file_path: "foo.ts", offset: 2, limit: 5 }),
+    }],
+  });
+  expect(events.at(-1)).toEqual({ type: "done" });
 });

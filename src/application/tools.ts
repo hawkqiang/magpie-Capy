@@ -1,140 +1,126 @@
-import type { ToolDefinition } from "../domain/chat.ts";
-import type { ToolBridgePort, ToolParseResult } from "../ports/tool-bridge.ts";
+import type { ToolDefinition, ToolCall } from '../domain/chat.ts';
+import type { ToolBridgePort, ToolParseResult } from '../ports/tool-bridge.ts';
+import { cmdInstruction, extractToolCallTags, parseCmdTags, primaryArg } from './cmd-tags.ts';
+import { describeCommand } from './capture.ts';
 
-const FENCE = /^```(?:json)?\s*([\s\S]*?)\s*```$/iu;
+const FENCE = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/u;
 
-function functionOf(tool: ToolDefinition): { name: string; description: string; parameters: unknown } | null {
-  const name = String(tool.function.name ?? "").trim();
-  if (!name) return null;
-  return {
-    name,
-    description: String(tool.function.description ?? "").trim(),
-    parameters: tool.function.parameters ?? { type: "object", properties: {} },
-  };
+function object(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function forcedName(toolChoice: unknown): string {
-  if (!toolChoice || typeof toolChoice !== "object") return "";
-  const value = toolChoice as { function?: { name?: unknown }; name?: unknown };
-  return typeof value.function?.name === "string"
-    ? value.function.name
-    : typeof value.name === "string"
-      ? value.name
-      : "";
+function propsOf(tool: ToolDefinition): Record<string, unknown> {
+  const params = tool.function.parameters;
+  if (!params || typeof params !== 'object') return {};
+  const props = (params as { properties?: unknown }).properties;
+  return object(props) ? props : {};
 }
 
-export class PromptToolBridge implements ToolBridgePort {
-  instruction(tools: readonly ToolDefinition[], toolChoice: unknown): string {
-    const defs = tools.map(functionOf).filter((item): item is NonNullable<typeof item> => Boolean(item));
-    if (defs.length === 0) return "";
-    const forced = forcedName(toolChoice);
-    const required = forced || toolChoice === "required";
-    const lines = [
-      "# Tools",
-      "You can call these tools when the user's request needs them:",
-      JSON.stringify(defs, null, 2),
-      "",
-      "To call a tool, reply with exactly one JSON object and nothing else:",
-      "{\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{}}]}",
-      "Do not wrap the JSON in a code fence. Do not add text before or after it.",
-      "If no tool is needed, answer normally in text.",
-    ];
-    if (forced) lines.push(`You must call the tool "${forced}" now.`);
-    else if (required) lines.push("You must call at least one tool now.");
-    return lines.join("\n");
-  }
-
-  parse(text: string): ToolParseResult | null {
-    const direct = normalizeCalls(tryJson(text));
-    if (direct) return { calls: direct };
-    for (const candidate of balancedObjects(text)) {
-      const calls = normalizeCalls(tryJson(candidate));
-      if (calls) return { calls };
-    }
-    return null;
-  }
-}
-
-function normalizeArguments(value: unknown): string {
-  if (typeof value === "string") {
-    const text = value.trim();
-    if (!text) return "{}";
-    try {
-      return JSON.stringify(JSON.parse(text) ?? {});
-    } catch {
-      return text;
-    }
-  }
-  if (value === undefined || value === null) return "{}";
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return "{}";
-  }
-}
-
-function normalizeCalls(value: unknown): ToolParseResult["calls"] | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as { tool_calls?: unknown; calls?: unknown };
-  const raw: unknown[] = Array.isArray(record.tool_calls)
-    ? record.tool_calls
-    : Array.isArray(record.calls)
-      ? record.calls
-      : Array.isArray(value)
-        ? value
-        : [value];
-  const calls: { name: string; arguments: string }[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as { function?: { name?: unknown; arguments?: unknown }; name?: unknown; arguments?: unknown };
-    const fn = record.function ?? record;
-    const name = typeof fn.name === "string" ? fn.name.trim() : "";
-    if (!name) continue;
-    calls.push({ name, arguments: normalizeArguments(fn.arguments) });
-  }
-  return calls.length > 0 ? calls : null;
-}
-
-function tryJson(text: string): unknown {
+function packetText(text: string): string {
   const trimmed = text.trim();
-  if (!trimmed) return null;
-  const unfenced = FENCE.exec(trimmed)?.[1]?.trim() ?? trimmed;
-  try {
-    return JSON.parse(unfenced);
-  } catch {
-    return null;
-  }
+  const fenced = FENCE.exec(trimmed);
+  return fenced?.[1]?.trim() ?? trimmed;
 }
 
-function balancedObjects(text: string): string[] {
-  const out: string[] = [];
-  const starts: number[] = [];
-  let inString = false;
-  let escaped = false;
-  let steps = 0;
-  const budget = Math.min(1_000_000, Math.max(10_000, text.length * 2));
+export function forcedName(choice: unknown): string | undefined {
+  if (object(choice) && choice.type === 'function' && object(choice.function) && typeof choice.function.name === 'string') return choice.function.name;
+  return undefined;
+}
 
-  for (let i = 0; i < text.length; i += 1) {
-    steps += 1;
-    if (steps > budget) break;
-    const ch = text[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === "{") starts.push(i);
-    else if (ch === "}") {
-      const start = starts.pop();
-      if (start === undefined) continue;
-      if (starts.length === 0) {
-        out.push(text.slice(start, i + 1));
-        if (out.length >= 32) break;
+function normalizeStructuredCall(
+  item: unknown,
+  byName: ReadonlyMap<string, ToolDefinition>,
+  forced: string | undefined,
+): Omit<ToolCall, 'id'> | null {
+  if (!object(item)) return null;
+  const keys = Object.keys(item);
+  if (keys.length !== 2 || typeof item.name !== 'string' || !object(item.arguments)) return null;
+  const tool = byName.get(item.name);
+  if (!tool) return null;
+  if (forced !== undefined && forced !== item.name) return null;
+  const args: Record<string, unknown> = { ...item.arguments };
+  const props = propsOf(tool);
+  if ('description' in props && typeof args.description !== 'string' && typeof args.command === 'string') {
+    args.description = describeCommand(args.command);
+  }
+  return { name: item.name, arguments: JSON.stringify(args) };
+}
+
+/**
+ * 客户端工具文本桥（配合方案 B Machine RPC 拦截做兜底）。
+ *
+ * 优先级：
+ * 1. <TOOL_CALL>{"name":"...","arguments":{...}}</TOOL_CALL> —— 支持任意多参数 DSH 工具。
+ * 2. 整段 JSON 包 {"tool_calls":[...]} —— 兼容直接输出 JSON 包的模型。
+ * 3. <CMD>命令</CMD> —— 单命令防转义破坏，自动补全 pwsh/bash 的必填 description。
+ */
+export class PromptToolBridge implements ToolBridgePort {
+  instruction(tools: readonly ToolDefinition[], choice: unknown): string {
+    if (!tools.length || choice === 'none') return '';
+    const forced = forcedName(choice);
+    return cmdInstruction(tools, forced, choice === 'required');
+  }
+
+  parse(text: string, tools: readonly ToolDefinition[], choice: unknown): ToolParseResult | null {
+    if (!tools.length || choice === 'none') return null;
+    const forced = forcedName(choice);
+    if (choice !== undefined && choice !== 'auto' && choice !== 'required' && !forced) return null;
+    const byName = new Map(tools.map((t) => [t.function.name, t]));
+    const allowed = new Set(byName.keys());
+
+    // 1. <TOOL_CALL> 结构化标签（支持多参数工具，如 edit / read(offset,limit) / glob / grep）
+    const tagBodies = extractToolCallTags(text);
+    if (tagBodies.length > 0) {
+      const calls: Omit<ToolCall, 'id'>[] = [];
+      for (const body of tagBodies) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return null;
+        }
+        const call = normalizeStructuredCall(parsed, byName, forced);
+        if (!call) return null;
+        calls.push(call);
       }
+      if (forced !== undefined && calls.length !== 1) return null;
+      return calls.length > 0 ? { calls } : null;
     }
-  }
-  return out;
-}
 
+    // 2. 整段 JSON 包（{"tool_calls":[...]}）
+    try {
+      const value: unknown = JSON.parse(packetText(text));
+      if (object(value) && Object.keys(value).length === 1 && Array.isArray(value.tool_calls) && value.tool_calls.length > 0) {
+        if (forced !== undefined && value.tool_calls.length !== 1) return null;
+        const calls: Omit<ToolCall, 'id'>[] = [];
+        for (const item of value.tool_calls as unknown[]) {
+          const call = normalizeStructuredCall(item, byName, forced);
+          if (!call) return null;
+          calls.push(call);
+        }
+        return { calls };
+      }
+    } catch {
+      // 不是整段 JSON，继续走 <CMD> 解析
+    }
+
+    // 3. <CMD> 单命令标签
+    const parsed = parseCmdTags(text, allowed);
+    if (!parsed || parsed.calls.length === 0) return null;
+    if (forced !== undefined && (parsed.calls.length !== 1 || parsed.calls[0]?.name !== forced)) return null;
+
+    const calls: Omit<ToolCall, 'id'>[] = [];
+    for (const call of parsed.calls) {
+      const tool = byName.get(call.name);
+      if (!tool) return null;
+      const arg = primaryArg(tool);
+      if (!arg) return null;
+      const args: Record<string, unknown> = { [arg]: call.command };
+      if ('description' in propsOf(tool) && arg !== 'description') {
+        args.description = describeCommand(call.command);
+      }
+      calls.push({ name: call.name, arguments: JSON.stringify(args) });
+    }
+    return { calls };
+  }
+}

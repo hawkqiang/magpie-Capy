@@ -31,6 +31,9 @@ export class PublicSseNormalizer {
   private finalText = "";
   private lastText = "";
   private sawDelta = false;
+  private hasFinal = false;
+  // 上游 agent 只要走过自己的工具通道，就记一笔：它是“模型可能在内部执行”的唯一可信信号。
+  private internalTools = false;
   private errored = false;
   private finished = false;
 
@@ -39,6 +42,9 @@ export class PublicSseNormalizer {
     switch (frame.event) {
       case "assistant":
         return this.onAssistant(parseJson<AssistantPayload>(frame.data));
+      case "tool_call":
+        this.internalTools = true;
+        return [];
       case "transcript":
         return this.onTranscript(parseJson<TranscriptPayload>(frame.data));
       case "error":
@@ -55,15 +61,26 @@ export class PublicSseNormalizer {
   finish(): ChatEvent[] {
     if (this.errored) return [];
     const events: ChatEvent[] = [];
-    const text = this.finalText || this.lastText;
-    if (text) events.push({ type: "final", text });
+    const text = this.hasFinal ? this.finalText : this.lastText;
+    if (text) {
+      events.push({
+        type: "final",
+        text,
+        committed: this.hasFinal,
+        ...(this.internalTools ? { internalTools: true } : {}),
+      });
+    }
     events.push({ type: "done" });
     this.finished = true;
     return events;
   }
 
   get text(): string {
-    return this.finalText || this.lastText;
+    return this.hasFinal ? this.finalText : this.lastText;
+  }
+
+  get usedInternalTools(): boolean {
+    return this.internalTools;
   }
 
   get hasError(): boolean {
@@ -88,7 +105,12 @@ export class PublicSseNormalizer {
   }
 
   private onTranscript(payload: TranscriptPayload | null): ChatEvent[] {
-    if (!payload || payload.source !== "assistant") return [];
+    if (!payload) return [];
+    // 已提交的 tool 记录同样说明上游 agent 走过内部工具（哪怕最后给的是正文）。
+    if (payload.source === "tool") this.internalTools = true;
+    if (payload.source !== "assistant") return [];
+    // 只有 transcript 是已提交记录；turn dropped/中断时 live 片段不可作为调用依据。
+    this.hasFinal = true;
     const text = typeof payload.text === "string" ? payload.text : "";
     if (!text) return [];
     const previous = this.lastText;

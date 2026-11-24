@@ -6,7 +6,7 @@ import type {
   ToolDefinition,
 } from "../domain/chat.ts";
 import { CapyError, toOpenAiError } from "../domain/errors.ts";
-import type { ChatEvent } from "../domain/chat.ts";
+import type { ChatEvent, ChatFinalEvent } from "../domain/chat.ts";
 
 export function parseChatRequest(body: unknown): ChatRequest {
   if (!isRecord(body)) throw invalid("请求体必须是 JSON 对象");
@@ -24,13 +24,22 @@ export function parseChatRequest(body: unknown): ChatRequest {
       ? reasoning.effort
       : undefined;
 
+  if (body.tools !== undefined && body.tools !== null && !Array.isArray(body.tools)) throw invalid("tools 必须为数组");
+  const tools = Array.isArray(body.tools) ? body.tools.map(parseTool) : undefined;
+  const names = new Set(tools?.map(t => t.function.name));
+  if (names.size !== (tools?.length ?? 0)) throw invalid("工具名重复");
+  // OpenAI 客户端常把未设置的字段序列化成 null；按“未提供”处理，不误判为非法 choice。
+  const choice = body.tool_choice === null ? undefined : body.tool_choice;
+  if (choice !== undefined && choice !== "auto" && choice !== "none") {
+    if (choice === "required" ? !names.size : !(isRecord(choice) && choice.type === "function" && isRecord(choice.function) && typeof choice.function.name === "string" && names.has(choice.function.name))) throw invalid("tool_choice 无效或没有匹配的工具");
+  }
   return {
     model,
     messages,
     stream: body.stream === true,
     ...(reasoningEffort ? { reasoningEffort } : {}),
-    ...(Array.isArray(body.tools) ? { tools: body.tools.map(parseTool) } : {}),
-    ...(body.tool_choice === undefined ? {} : { toolChoice: body.tool_choice }),
+    ...(tools ? { tools } : {}),
+    ...(choice === undefined ? {} : { toolChoice: choice }),
   };
 }
 
@@ -191,6 +200,8 @@ export function encodeToolCallCompletion(
       },
       finish_reason: "tool_calls",
     }],
+    // 与普通非流式响应一致：占位，不伪造 token 计数。
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   }), { status: 200, headers: JSON_HEADERS });
 }
 
@@ -306,13 +317,33 @@ function invalid(message: string): CapyError {
 }
 
 export async function collectText(events: AsyncIterable<ChatEvent>): Promise<string> {
-  let text = "";
+  return (await collectReply(events)).text;
+}
+
+export interface Reply {
+  readonly text: string;
+  /** true 只在 Capy 提交了 assistant transcript 时为真。 */
+  readonly committed: boolean;
+  /** 上游 agent 用过自己的工具通道；调用方据此区分“模型建议执行”和“真在内部执行过”。 */
+  readonly internalTools: boolean;
+  /** 方案 B 按 jamId 实时截获的客户端工具调用（若存在）。 */
+  readonly capturedCalls?: readonly Omit<ToolCall, "id">[];
+}
+
+export async function collectReply(events: AsyncIterable<ChatEvent>): Promise<Reply> {
+  let deltas = "";
+  let final: ChatFinalEvent | null = null;
   for await (const event of events) {
-    if (event.type === "delta") text += event.text;
-    else if (event.type === "final" && !text) text = event.text;
+    if (event.type === "delta") deltas += event.text;
+    else if (event.type === "final") final = event;
     else if (event.type === "error") throw event.error;
   }
-  return text;
+  return {
+    text: final ? (final.committed ? final.text : final.text || deltas) : deltas,
+    committed: final?.committed === true,
+    internalTools: final?.internalTools === true,
+    ...(final?.capturedCalls ? { capturedCalls: final.capturedCalls } : {}),
+  };
 }
 
 export async function* textEvents(text: string): AsyncIterable<ChatEvent> {

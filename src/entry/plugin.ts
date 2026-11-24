@@ -1,3 +1,6 @@
+import { FileThreadStore } from "../adapters/platform/file-thread-store.ts";
+import { providerMetadata } from './provider-metadata.ts';
+import { bridgeResponse } from './bridge-response.ts';
 import { STATIC_CATALOG } from "../adapters/capy/static-catalog.ts";
 import { CapyAppClient } from "../adapters/capy/app-client.ts";
 import { CapyLoginSources } from "../adapters/capy/browser-login.ts";
@@ -29,11 +32,8 @@ import {
   encodeCompletion,
   encodeErrorResponse,
   encodeModelList,
-  encodeToolCallCompletion,
-  encodeToolCallStream,
   collectText,
   parseChatRequest,
-  textEvents,
 } from "../protocol/openai.ts";
 
 const DEFAULT_PROVIDER_ID = "capy";
@@ -44,6 +44,8 @@ const REFRESH_LEAD_MS = 24 * 3600_000;
 interface PluginOptions {
   readonly providerId?: string;
   readonly toolsEnabled?: boolean;
+  /** 线程复用开关；设为 false 时每次请求新建 Capy 线程（旧行为）。 */
+  readonly threadReuse?: boolean;
   readonly proxy?: string | false;
   readonly promptVariant?: "auto" | "minimal" | "default";
 }
@@ -84,7 +86,12 @@ export default async function CapyPlugin(
   const app = new CapyAppClient(fetchImpl);
   const publicApi = new CapyPublicClient(fetchImpl);
   const store = new FileSecretStore();
-  const runtime = new HeadlessDeviceRuntime({ app, store, clock, logger });
+  const runtime = new HeadlessDeviceRuntime({
+    app,
+    store,
+    clock,
+    logger,
+  });
   const device = new DeviceUseCase(runtime);
   const login = new LoginUseCase({ app, sources: new CapyLoginSources() });
   const catalog = new CatalogUseCase({
@@ -95,7 +102,20 @@ export default async function CapyPlugin(
   });
   const usage = new UsageUseCase({ publicApi, cache });
   const tools = new PromptToolBridge();
-  const chat = new ChatUseCase({ app, publicApi, device, ids, clock, tools, toolsEnabled });
+  const chat = new ChatUseCase({
+    app,
+    publicApi,
+    device,
+    ids,
+    clock,
+    tools,
+    toolsEnabled,
+    threadReuse: options.threadReuse !== false && process.env.MAGPIE_CAPY_THREAD_REUSE !== "0",
+    threadStore: new FileThreadStore(),
+    ...(process.env.MAGPIE_CAPY_TOOL_DIAGNOSTICS === "1"
+      ? { onDiagnostic: (name: string, fields: Record<string, string | number | boolean>) => logger.event(name, fields) }
+      : {}),
+  });
   const initialModels = staticModels(providerId, toolsEnabled);
 
   async function modelsFor(session: AccountSession): Promise<Record<string, MagpieModel>> {
@@ -256,7 +276,13 @@ export default async function CapyPlugin(
               } catch {
                 return encodeErrorResponse(new CapyError("invalid_request", "请求体不是合法 JSON"));
               }
+              if (process.env.MAGPIE_CAPY_TOOL_DIAGNOSTICS === "1") {
+                logger.event("provider.tools", providerMetadata(body));
+              }
               const requestBody: ChatRequest = parseChatRequest(body);
+              if (!toolsEnabled && (requestBody.toolChoice === "required" || typeof requestBody.toolChoice === "object")) {
+                throw new CapyError("invalid_request", "工具桥已关闭，无法满足 tool_choice");
+              }
               const snapshot = await catalog.load(session.accessToken, signal, accountKey(session));
               const model = resolveModel(requestBody.model, snapshot.models);
               const modelId = model.id;
@@ -292,25 +318,22 @@ export default async function CapyPlugin(
                 created: Math.floor(clock.now() / 1000),
               };
 
-              const wantsTools = toolsEnabled && (requestBody.tools?.length ?? 0) > 0;
-              if (wantsTools) {
-                const text = await collectText(events);
-                const parsed = text ? tools.parse(text) : null;
-                if (parsed) {
-                  const calls = parsed.calls.map((call) => ({
-                    id: `call_${ids.ulid()}`,
-                    name: call.name,
-                    arguments: call.arguments,
-                  }));
-                  return requestBody.stream
-                    ? encodeToolCallStream(meta, calls)
-                    : encodeToolCallCompletion(meta, calls);
-                }
-                return requestBody.stream
-                  ? encodeChatStream(textEvents(text), meta)
-                  : encodeCompletion(meta.id, meta.model, meta.created, text);
+              if (toolsEnabled && requestBody.tools?.length && requestBody.toolChoice !== "none") {
+                return await bridgeResponse(
+                  requestBody,
+                  events,
+                  meta,
+                  tools,
+                  () => `call_${ids.ulid()}`,
+                  // 只报计数与布尔值：验收时用来区分“模型照契约返回调用”与“上游自己执行了工具”。
+                  (outcome) => {
+                    if (process.env.MAGPIE_CAPY_TOOL_DIAGNOSTICS === "1") {
+                      logger.event("provider.tools.outcome", { ...outcome });
+                    }
+                  },
+                  () => activeThreadId,
+                );
               }
-
               if (requestBody.stream) return encodeChatStream(events, meta);
               return encodeCompletion(meta.id, meta.model, meta.created, await collectText(events));
             } catch (error) {

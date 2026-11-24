@@ -15,6 +15,7 @@ function publicPort(overrides: Partial<CapyPublicPort> = {}): CapyPublicPort {
       };
     },
     async *streamThread() {},
+    async sendMessage() {},
     async uploadFiles() { return []; },
     async usage() { return {}; },
     async balance() { return {}; },

@@ -50,12 +50,34 @@ export class CapyPublicClient implements CapyPublicPort {
     return { items: rawModels(record.items) };
   }
 
+  async sendMessage(
+    apiKey: string,
+    threadId: string,
+    text: string,
+    clientKey: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await requestCapyJson(
+      this.fetchImpl,
+      `${CAPY_PUBLIC}/threads/${encodeURIComponent(threadId)}/message`,
+      {
+        method: "POST",
+        headers: publicHeaders(apiKey, { "content-type": "application/json" }),
+        body: JSON.stringify({ text, clientKey, delivery: "queue" }),
+        ...(signal ? { signal } : {}),
+      },
+      30_000,
+    );
+  }
+
   async *streamThread(
     apiKey: string,
     threadId: string,
     signal?: AbortSignal,
+    after?: string,
   ): AsyncIterable<UpstreamSseFrame> {
-    const url = `${CAPY_PUBLIC}/threads/${encodeURIComponent(threadId)}/stream?until=run`;
+    const afterParam = after ? `&after=${encodeURIComponent(after)}` : "";
+    const url = `${CAPY_PUBLIC}/threads/${encodeURIComponent(threadId)}/stream?until=run${afterParam}`;
     let response: Response;
     try {
       response = await this.fetchImpl(url, {

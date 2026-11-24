@@ -9,3 +9,5 @@
 | [005](./adr/005-capability-registry.md) | 能力注册表 + 模型策略 + 可替换 ToolBridge | Accepted |
 | [006](./adr/006-no-database.md) | 不引入数据库/队列；DPAPI 极小状态 | Accepted |
 | [007](./adr/007-provider-id.md) | provider id = `capy` | Accepted |
+| [008](./adr/008-client-tool-bridge.md) | 方案 C 客户端工具桥；隧道仅控制面 | Accepted |
+| [009](./adr/009-thread-store.md) | 线程复用 + ThreadStorePort（真机低价值，默认开） | Accepted |

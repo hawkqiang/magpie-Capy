@@ -28,7 +28,16 @@ export interface CapyPublicPort {
     apiKey: string,
     threadId: string,
     signal?: AbortSignal,
+    /** 从该 transcript cursor 之后开始推送；复用线程时用来跳过旧记录。 */
+    after?: string,
   ): AsyncIterable<UpstreamSseFrame>;
+  sendMessage(
+    apiKey: string,
+    threadId: string,
+    text: string,
+    clientKey: string,
+    signal?: AbortSignal,
+  ): Promise<void>;
   uploadFiles(
     apiKey: string,
     files: readonly UploadCandidate[],

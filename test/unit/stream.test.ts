@@ -17,7 +17,7 @@ test("assistant 增量：累积 + finish", () => {
   expect(events).toEqual([
     { type: "delta", text: "po" },
     { type: "delta", text: "ng" },
-    { type: "final", text: "pong" },
+    { type: "final", text: "pong", committed: false },
     { type: "done" },
   ]);
 });
@@ -40,7 +40,17 @@ test("transcript 校正：只有 transcript 时补发 delta", () => {
   expect(events).toEqual([
     { type: "delta", text: "po" },
     { type: "delta", text: "ng" },
-    { type: "final", text: "pong" },
+    { type: "final", text: "pong", committed: true },
+    { type: "done" },
+  ]);
+});
+
+test("只有预览、没有 transcript：final 标记未提交", () => {
+  const normalizer = new PublicSseNormalizer();
+  normalizer.push(frame("assistant", { callId: "c1", text: "partial" }));
+  normalizer.push(frame("turn", { phase: "end", outcome: "dropped" }));
+  expect(normalizer.finish()).toEqual([
+    { type: "final", text: "partial", committed: false },
     { type: "done" },
   ]);
 });
@@ -62,4 +72,37 @@ test("user transcript / status / heartbeat 不进入事件流", () => {
   expect(normalizer.push(frame("transcript", { source: "user", text: "hi" }))).toEqual([]);
   expect(normalizer.push(frame("status", { status: "working" }))).toEqual([]);
   expect(normalizer.push({ event: "heartbeat", data: "{}" })).toEqual([]);
+});
+
+test("上游 tool_call 摘要被忽略，不变成调用事件", () => {
+  const normalizer = new PublicSseNormalizer();
+  const events = [
+    ...normalizer.push(frame("tool_call", { callId: "toolu_1", name: "bash", text: "Running tests" })),
+    ...normalizer.finish(),
+  ];
+  expect(events).toEqual([{ type: "done" }]);
+});
+
+test("内部工具信号：live tool_call / transcript(tool) 都记账，但不产生调用", () => {
+  const live = new PublicSseNormalizer();
+  live.push(frame("tool_call", { callId: "t1", name: "bash", text: "x" }));
+  live.push(frame("transcript", { source: "assistant", text: "done", callId: "a1" }));
+  expect(live.usedInternalTools).toBe(true);
+  expect(live.finish()).toEqual([
+    { type: "final", text: "done", committed: true, internalTools: true },
+    { type: "done" },
+  ]);
+
+  const committed = new PublicSseNormalizer();
+  committed.push(frame("transcript", { source: "tool", id: "t2", tool: "read", text: "summary" }));
+  committed.push(frame("transcript", { source: "assistant", text: "ok", callId: "a2" }));
+  expect(committed.usedInternalTools).toBe(true);
+
+  const plain = new PublicSseNormalizer();
+  plain.push(frame("transcript", { source: "assistant", text: "hi", callId: "a3" }));
+  expect(plain.usedInternalTools).toBe(false);
+  expect(plain.finish()).toEqual([
+    { type: "final", text: "hi", committed: true },
+    { type: "done" },
+  ]);
 });

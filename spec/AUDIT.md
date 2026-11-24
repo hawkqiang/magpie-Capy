@@ -55,9 +55,15 @@
 | 设备卡 `used=0/100`、`aside:true` | `src/application/usage.ts` | Magpie 展示策略 |
 | `temperature:false` | `src/entry/plugin.ts` | Capy `ModelSelection` 没有 temperature，属于协议事实 |
 | 所有模型 `image/pdf/attachment=true` | `src/domain/model.ts` | Capy files 通道接受图片/PDF；模型是否“看懂”由模型决定；不是 `/models` 字段 |
-| `toolcall=true` | `src/domain/model.ts` | 不是原生 tools，是 `PromptToolBridge` 的提示词约定 |
+| `toolcall=true` | `src/domain/model.ts` | 不是原生 tools；表示方案 C 客户端工具桥可用（由 `toolsEnabled` 决定） |
 | 非流式 `usage` 全 0 | `src/protocol/openai.ts` | 占位；Capy 公共 SSE 不给 token 计数 |
-| `PromptToolBridge` | `src/application/tools.ts` | 提示词桥；Capy agent 可能忽略并用自己的工具 |
+| `PromptToolBridge` | `src/application/tools.ts` | 方案 C：每请求白名单、只接受完整单包（可整段围栏、包内多调用）、只解析 committed transcript；不是原生通道 |
+| 工具提示词声明设备无 shell/文件工具 | `src/application/tools.ts` | 与隧道拒绝一致；提示词不是隔离机制 |
+| machine RPC 白名单：仅 worktree / volume + 空 git capture | `src/adapters/capy/device-tunnel.ts` | 插件策略：生产隧道只承担控制面；其余 handler 一律 `MachineServer.Unavailable` |
+| 隧道无 activeRoot、无子进程、无文件工具 | `src/adapters/capy/device-tunnel.ts` | 已删除执行面；handler 侧唯一文件系统操作是 `worktree_ensure` 在 `worktreeBase` 下建目录（设备 token 持久化另属控制面状态） |
+| 工具调用 ID = `call_` + ULID | `src/entry/plugin.ts` | Provider 分配；客户端后续以 `tool_call_id` 回传，插件把 ID/参数/结果写进 prompt 文本，不补造 |
+| 工具白名单按请求构造 | `src/application/tools.ts` | 方案 C：`PromptToolBridge` 无可变状态，不接受未声明工具 |
+| 带工具请求先收全文再编码 | `src/entry/bridge-response.ts` | 调用包必须是完整 JSON；该路径不逐 token 流式 |
 | `npm: "@ai-sdk/openai-compatible"` | `src/entry/plugin.ts` | 给 Magpie 的 SDK 提示；Capy 没有官方 SDK |
 | `searches: false` | `src/entry/plugin.ts` | 告诉 Magpie 没有搜索能力；不是 Capy 字段 |
 | `redact` 模式 | `src/observability/redact.ts` | 安全策略 |
@@ -82,6 +88,9 @@
 | `hasUsableSession` / `usageAuthError` / `CatalogSource` / `promptToolBridge` 单例 / 多个 `_internal` | 没有调用方 | 删除 |
 | entry `DEFAULT_MODEL_ID` / `PUBLIC_API_BASE` / `_internal` 导出 | 没有外部引用 | 收成文件内常量/函数 |
 | `ChatUseCase.getJam(...).catch(() => null)` | 静默吞掉状态检查错误，可能掩盖 credits/desktop 阻塞 | 改为让错误向上抛 |
+| 内置 `bash` / `bash_output` / `read` / `write` / `edit` / `file_*` handler | 与“隧道仅控制面”冲突，等于把设备变成远程 shell/文件入口 | 删除；统一返回 `MachineServer.Unavailable` |
+| `activeRoot` 与设备侧执行状态 | 让隧道持有活动工作目录，容易被当成通用执行面 | 删除；隧道只在 `worktreeBase` 下建目录，不保存 activeRoot |
+| 部分采纳工具包 / 模型自带执行结果 | 会把不完整调用或伪造结果当成成功 | 整包校验；结果只接受客户端 `role:"tool"` 消息 |
 
 ---
 
@@ -98,6 +107,9 @@
 | `ChatUseCase` JWT 缓存 50s | `application/chat.ts` | 保留（性能策略） |
 | `buildUsage` 无余额 `used=100` | `application/usage.ts` | 保留（Magpie 路由策略，已注释） |
 | `parseToolCalls` 缺 id 的调用直接跳过 | `protocol/openai.ts` | 保留；不伪造 tool_call id |
+| 工具包非法/不完整 → `auto` 下按文本返回 | `entry/bridge-response.ts` | 保留；不部分采纳、不伪造调用 |
+| `tool_choice` required/指定工具未满足 → 502 `upstream_error` | `entry/bridge-response.ts` | 保留；明确失败，不返回空调用 |
+| 工具桥关闭 + required/指定工具 → 400 `invalid_request` | `entry/plugin.ts` | 保留；不静默忽略 |
 
 
 ---
@@ -112,8 +124,8 @@
 | `CatalogUseCase` | 已接 `auth.loader /models` 与 `provider.models` |
 | `ChatUseCase` | 已接 `/chat/completions`（流式/非流式） |
 | `UsageUseCase` | 已接 `auth.usage` |
-| `PromptToolBridge` | instruction 已接；输出解析已接（模型配合时才返回 tool_calls） |
-| `DeviceUseCase` + `HeadlessDeviceRuntime` | 已接；真实设备配对/隧道/machine RPC |
+| `PromptToolBridge` | instruction 已接；输出解析已接；只解析 committed transcript，required/指定工具未满足时明确失败 |
+| `DeviceUseCase` + `HeadlessDeviceRuntime` | 已接；真实设备配对/隧道 + 控制面 machine RPC（worktree/volume/空 git capture） |
 | `CapyAppClient` / `CapyPublicClient` / `ClerkClient` | 已实现并接线 |
 | `FileSecretStore` | 已实现（Windows DPAPI；其他平台 0600） |
 | `collectAttachments` + `uploadFiles` | 已接；图片/PDF 走 files 通道 |
@@ -124,8 +136,8 @@
 
 | 代码 | 现状 |
 |---|---|
-| 完整 machine server | 已有 bash/read/write/edit + worktree/volume/git；浏览器/computer 仍返回 `MachineServer.Unavailable` |
-| 原生 OpenAI tools | Capy agent 没有原生 tools；只有 PromptToolBridge，模型可能拒绝/忽略 |
+| 完整 machine server | 生产隧道只保留 worktree/volume + 空 git capture；bash/文件/浏览器/computer 及其他 handler 一律 `MachineServer.Unavailable` |
+| 原生 OpenAI tools | Capy 没有原生 tools 通道；只有方案 C 客户端工具桥，模型可能不按约定返回调用 |
 | 浏览器登录的自动化 e2e | 代码已实现；测试只验证启动/取消，完整登录需要人工 |
 | 设备/线程删除、旧设备清理 | 没有接；避免破坏性操作 |
 | 自动化 e2e / 发布流程 | 未做 |
@@ -159,7 +171,7 @@ entry 的 `_internal` / `DEFAULT_MODEL_ID` / `PUBLIC_API_BASE` 导出。
 ### 5.5 仍属计划、不是死代码
 
 `src/ports/**` 是冻结接口；`src/application/**` 的部分能力（浏览器/computer、
-原生 tools）还没有实现。它们不是“删掉就行”的死代码，而是明确的后续工作。
+原生 tools 通道、真实 worktree/volume 语义）还没有实现。它们不是“删掉就行”的死代码，而是明确的后续工作。
 
 ---
 
@@ -173,7 +185,9 @@ entry 的 `_internal` / `DEFAULT_MODEL_ID` / `PUBLIC_API_BASE` 导出。
 | 非流式 `usage` 全 0 | `protocol/openai.ts` | 占位；不是真实 token 计数 |
 | `variants` 每个 reasoningMode 映射到空对象 | `entry/plugin.ts` | Magpie 变体占位；没有真实参数 |
 | `parseChatRequest` 只接受 `type:"function"` 工具 | `protocol/openai.ts` | OpenAI 目前只有 function tools |
-| `PromptToolBridge` 用固定英文提示词 + JSON 契约 | `application/tools.ts` | 模型可能忽略；不是原生 tools |
+| `PromptToolBridge` 用固定英文提示词 + JSON 契约 | `application/tools.ts` | 模型可能不配合；不是原生 tools；只接受整段单包（可整段围栏），任一项非法即整包拒绝 |
+| 只有 committed transcript 能转成调用 | `entry/bridge-response.ts` | 实时预览在 turn dropped/abort 时可能不完整；据它执行会伪造调用 |
+| 带工具请求先收全文再编码 | `entry/bridge-response.ts` | 方案 C 需要完整 JSON 调用包；该路径不逐 token 流式 |
 | `isoOf` 数字 >1e12 当毫秒，否则当秒 | `application/usage.ts` | 兼容两种时间戳 |
 | 无余额/未知余额统一 `used=100` | `application/usage.ts` | Magpie 路由策略 |
 | 所有模型 `image/pdf/attachment` | `domain/model.ts` | files 通道能力，不是模型能力 |
@@ -190,7 +204,7 @@ entry 的 `_internal` / `DEFAULT_MODEL_ID` / `PUBLIC_API_BASE` 导出。
 | 非流式 `usage` 全 0 | 不是真实用量 | 后续可从 `context-usage`/`usage` 补，或省略 usage |
 | `promptVariant:"minimal"` 403 降级 | 已实现：403 自动改 default 重试并记住 | Works |
 | 附件上传/SSRF | 已实现；文件缓存未做 | 限制按 250MB/文件；缓存可选 |
-| 工具调用 | 只支持“模型输出 JSON”桥，不是原生 tools | 保持明确边界；不要宣称原生 tools |
+| 工具调用 | 只支持方案 C 的文本 JSON 桥，不是原生 tools，也不在 Capy 侧执行 | 保持明确边界；不要宣称原生通道或 Capy 执行客户端工具 |
 
 ---
 
@@ -205,8 +219,8 @@ V0 已经能作为 Magpie 插件运行：
 还未做（按优先级）：
 
 1. 浏览器登录的完整人工回归（代码已实现，当前只 smoke 了启动/取消）
-2. 原生 tools（Capy agent 无此能力，只能 PromptToolBridge）
-3. 浏览器 / computer use（bash / 文件 / 工作区已实现）
+2. 原生 tools（Capy 无此通道；当前只有方案 C 客户端工具桥）
+3. 浏览器 / computer use（worktree/volume 控制面已实现；bash/文件已从隧道移除）
 4. 自动化 e2e / 发布流程
 
 ---

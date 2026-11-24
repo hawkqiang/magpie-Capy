@@ -1,6 +1,3 @@
-import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { StringDecoder } from "node:string_decoder";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +5,7 @@ import path from "node:path";
 import type { AccountSession } from "../../domain/account.ts";
 import { accountKey } from "../../domain/account.ts";
 import { CapyError, errorText, isAuthError } from "../../domain/errors.ts";
+import { CAPTURED_HANDLERS, captureInvocation, extractJamId } from "../../application/capture.ts";
 import type { HeadlessCredential, DeviceRuntimePort } from "../../ports/device-runtime.ts";
 import type { CapyAppPort, DeviceInfo } from "../../ports/capy-app.ts";
 import type { ClockPort, LoggerPort, SecretStorePort } from "../../ports/platform.ts";
@@ -157,235 +155,65 @@ function fail(code: string, message: string): MachineOutcome {
   return { status: "failed", error: { code, message } };
 }
 
-function fileFailure(error: unknown): MachineOutcome {
-  const code = (error as { code?: unknown } | null)?.code;
-  const message = error instanceof Error ? error.message : String(error);
-  if (code === "ENOENT") return fail("MachineServer.FileError", `not-found: ${message}`);
-  if (code === "EISDIR") return fail("MachineServer.FileError", `is-directory: ${message}`);
-  if (code === "EACCES" || code === "EPERM") return fail("MachineServer.FileError", `permission-denied: ${message}`);
-  return fail("MachineServer.FileError", `other: ${message}`);
-}
-
-function resolveIn(cwd: string, raw: unknown): string {
-  const value = String(raw ?? "").trim();
-  if (!value) throw new Error("path is required");
-  return path.isAbsolute(value) ? path.normalize(value) : path.resolve(cwd, value);
-}
-
-function sha256(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
-}
-
-async function runBash(params: Record<string, unknown>, cwd: string): Promise<MachineOutcome> {
-  const command = String(params.command ?? "");
-  if (!command.trim()) return fail("MachineServer.Bash", "bash command is empty");
-  const timeoutSeconds = Math.max(1, Math.min(600, Number(params.timeoutSeconds) || 120));
-  const runCwd = path.resolve(cwd);
-  try { fs.mkdirSync(runCwd, { recursive: true }); } catch { /* best effort */ }
-
-  const shell = String(process.env.MAGPIE_CAPY_BASH ?? "").trim() || "bash";
-  const env = {
-    ...process.env,
-    PS1: "",
-    NO_COLOR: "1",
-    TERM: "dumb",
-    LANG: "C.UTF-8",
-    LC_ALL: "C.UTF-8",
-    PAGER: "cat",
-    GIT_PAGER: "cat",
-    GH_PAGER: "cat",
-    COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
-  };
-  const startedAt = Date.now();
-  const maxChars = 4 * 1024 * 1024;
-
-  return await new Promise<MachineOutcome>((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let settled = false;
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(shell, ["-lc", command], { cwd: runCwd, env, windowsHide: true });
-    } catch (error) {
-      resolve(fail("MachineServer.Bash", `Failed to start bash: ${error instanceof Error ? error.message : String(error)}`));
-      return;
-    }
-    const stdoutDecoder = new StringDecoder("utf8");
-    const stderrDecoder = new StringDecoder("utf8");
-    const append = (current: string, text: string): string => {
-      if (current.length >= maxChars) return current;
-      return current + text.slice(0, maxChars - current.length);
-    };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { child.kill("SIGKILL"); } catch {}
-      if (process.platform === "win32" && child.pid) {
-        try {
-          spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }).unref();
-        } catch {}
-      }
-    }, timeoutSeconds * 1000);
-    timer.unref?.();
-    child.stdout?.on("data", (chunk: Buffer) => { stdout = append(stdout, stdoutDecoder.write(chunk)); });
-    child.stderr?.on("data", (chunk: Buffer) => { stderr = append(stderr, stderrDecoder.write(chunk)); });
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(fail("MachineServer.Bash", `Failed to start bash: ${error.message}`));
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      stdout = append(stdout, stdoutDecoder.end());
-      stderr = append(stderr, stderrDecoder.end());
-      resolve(ok({
-        kind: "bash",
-        stdout,
-        stderr,
-        exitCode: typeof code === "number" ? code : -1,
-        durationMs: Date.now() - startedAt,
-        timedOut,
-        isError: timedOut,
-        ...(timedOut ? { landingNote: "Command timed out and was stopped." } : {}),
-      }));
-    });
-  });
-}
-
-export async function machineResult(
-  handler: string,
-  params: Record<string, unknown>,
-  worktreeBase: string,
-): Promise<MachineOutcome> {
-  if (handler === "worktree_ensure") {
-    const root = String(params.root ?? "");
-    let created = false;
-    if (root) {
-      const base = path.resolve(worktreeBase);
-      const resolved = path.resolve(root);
-      if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) {
-        return fail("MachineServer.Refused", "worktree root outside worktreeBase");
-      }
-      created = !fs.existsSync(resolved);
-      fs.mkdirSync(resolved, { recursive: true });
-    }
-    return ok({ root: root ? path.resolve(root) : "", created, checkouts: [] });
+function ensureWorktree(base: string, raw: unknown): MachineOutcome {
+  if (!raw) return ok({ root: "", created: false, checkouts: [] });
+  const root = path.resolve(String(raw));
+  const rel = path.relative(base, root);
+  // 与上游一致：worktreeBase 本身是合法边界；只在它下面校验，绝不拿上一个 root 当基目录。
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return fail("MachineServer.Refused", "worktree root must be below worktreeBase");
   }
-  if (handler === "worktree_list") {
-    return ok({ kind: "worktree_list", entries: [] });
+  let current = base;
+  for (const part of rel ? rel.split(path.sep) : []) {
+    current = path.join(current, part);
+    if (fs.lstatSync(current, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      return fail("MachineServer.Refused", "worktree root contains a symbolic link");
+    }
   }
-  if (handler === "volume_landed") {
-    const mounts = Array.isArray(params.mounts) ? params.mounts : [];
+  const created = !fs.existsSync(root);
+  fs.mkdirSync(root, { recursive: true });
+  return ok({ root, created, checkouts: [] });
+}
+
+export class WorktreeMachine {
+  constructor(private readonly base: string) {}
+
+  invoke(handler: string, params: Record<string, unknown>): MachineOutcome {
+    if (handler === "worktree_ensure") return ensureWorktree(this.base, params.root);
+    if (handler === "worktree_list") {
+      return ok({ kind: "worktree_list", entries: [] });
+    }
+    if (handler === "volume_landed") {
+      const mounts = Array.isArray(params.mounts) ? params.mounts : [];
+      return ok({
+        kind: "volume_landed",
+        mounts: mounts.map((mount) => ({
+          mountPath: String((mount as Record<string, unknown>)?.mountPath ?? ""),
+          current: true,
+        })),
+        landing: false,
+        checkpoints: false,
+        directories: [],
+        unretained: [],
+        handback: true,
+      });
+    }
+    if (handler === "volume_probe") {
+      const mounts = Array.isArray(params.mounts) ? params.mounts : [];
+      return ok({
+        mounts: mounts.map((mount) => ({
+          mountPath: String((mount as Record<string, unknown>)?.mountPath ?? ""),
+          state: "current",
+        })),
+      });
+    }
+    // 中性拒绝：不触发模型的防提示词注入检测；真正需要工具的请求已通过方案 B 拦截并短路返回 DSH。
     return ok({
-      kind: "volume_landed",
-      mounts: mounts.map((mount) => ({
-        mountPath: String((mount as Record<string, unknown>)?.mountPath ?? ""),
-        current: true,
-      })),
-      landing: false,
-      checkpoints: false,
-      directories: [],
-      unretained: [],
-      handback: true,
+      kind: "failure",
+      isError: true,
+      message: "Tool execution is delegated to the client harness.",
     });
   }
-  if (handler === "volume_probe") {
-    const mounts = Array.isArray(params.mounts) ? params.mounts : [];
-    return ok({
-      mounts: mounts.map((mount) => ({
-        mountPath: String((mount as Record<string, unknown>)?.mountPath ?? ""),
-        state: "current",
-      })),
-    });
-  }
-  if (handler === "bash") return await runBash(params, worktreeBase);
-  if (handler === "bash_output") return ok({ kind: "not-running" });
-  if (handler === "read") {
-    try {
-      const file = resolveIn(worktreeBase, params.path);
-      const text = fs.readFileSync(file, "utf8");
-      const offset = Math.max(1, Number(params.offset) || 1);
-      const limit = Math.max(1, Math.min(10_000, Number(params.limit) || 2_000));
-      const maxChars = Math.max(200, Math.min(100_000, Number(params.maxChars) || 20_000));
-      const all = text.split(/\r?\n/u);
-      const content = all
-        .slice(offset - 1, offset - 1 + limit)
-        .map((line) => line.length > maxChars ? `${line.slice(0, maxChars)}... (line truncated to ${maxChars} chars)` : line)
-        .join("\n");
-      return ok({ kind: "read", content, offset, totalLines: all.length, isError: false });
-    } catch (error) {
-      return fileFailure(error);
-    }
-  }
-  if (handler === "write") {
-    try {
-      const file = resolveIn(worktreeBase, params.path);
-      const content = String(params.content ?? "");
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, content, "utf8");
-      return ok({ kind: "write", path: file, bytes: Buffer.byteLength(content), isError: false });
-    } catch (error) {
-      return fileFailure(error);
-    }
-  }
-  if (handler === "edit") {
-    try {
-      const file = resolveIn(worktreeBase, params.path);
-      const oldString = String(params.oldString ?? "");
-      const newString = String(params.newString ?? "");
-      if (!oldString || oldString === newString) {
-        return fail("MachineServer.FileError", "oldString must be non-empty and differ from newString");
-      }
-      const text = fs.readFileSync(file, "utf8");
-      const parts = text.split(oldString);
-      const count = parts.length - 1;
-      if (count === 0) return fail("MachineServer.FileError", `The text was not found in ${String(params.path)}`);
-      if (count > 1 && params.replaceAll !== true) {
-        return fail("MachineServer.FileError", `Found ${count} occurrences; provide more context or replaceAll`);
-      }
-      const next = params.replaceAll === true
-        ? parts.join(newString)
-        : `${parts[0] ?? ""}${newString}${parts.slice(1).join(oldString)}`;
-      fs.writeFileSync(file, next, "utf8");
-      return ok({ kind: "edit", path: file, replacements: count, isError: false });
-    } catch (error) {
-      return fileFailure(error);
-    }
-  }
-  if (handler === "file_read") {
-    try {
-      const file = resolveIn(worktreeBase, params.path);
-      const text = fs.readFileSync(file, "utf8");
-      return ok({ kind: "read", path: file, content: { text }, sha: sha256(text), isError: false });
-    } catch (error) {
-      if ((error as { code?: unknown } | null)?.code === "ENOENT") return ok({ kind: "missing", isError: false });
-      return fileFailure(error);
-    }
-  }
-  if (handler === "file_write") {
-    try {
-      const file = resolveIn(worktreeBase, params.path);
-      const content = String(params.content ?? "");
-      let currentSha: string | null = null;
-      try { currentSha = sha256(fs.readFileSync(file, "utf8")); } catch {}
-      const baseSha = typeof params.baseSha === "string" ? params.baseSha : null;
-      if (baseSha !== null && currentSha !== baseSha) {
-        return ok({ kind: "conflict", currentSha, isError: false });
-      }
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, content, "utf8");
-      return ok({ kind: "written", sha: sha256(content), bytes: Buffer.byteLength(content), isError: false });
-    } catch (error) {
-      return fileFailure(error);
-    }
-  }
-  return fail(
-    "MachineServer.Unavailable",
-    `无头设备未实现 ${handler || "unknown"}；浏览器/computer 等工具不会执行。`,
-  );
 }
 
 class HeadlessDevice {
@@ -398,7 +226,7 @@ class HeadlessDevice {
   private readyResolve: (() => void) | null = null;
   private readyReject: ((error: Error) => void) | null = null;
   private readonly streams = new Map<number, StreamState>();
-  private activeRoot: string | null = null;
+  private readonly machine: WorktreeMachine;
 
   constructor(options: {
     readonly credential: HeadlessCredential;
@@ -412,6 +240,7 @@ class HeadlessDevice {
     }
     this.WebSocketImpl = Impl;
     this.worktreeBase = options.worktreeBase ?? path.join(os.homedir(), ".capy", "worktrees");
+    this.machine = new WorktreeMachine(this.worktreeBase);
   }
 
   get info(): DeviceInfo {
@@ -612,11 +441,16 @@ class HeadlessDevice {
       const params = record.params && typeof record.params === "object"
         ? record.params as Record<string, unknown>
         : {};
-      result = await machineResult(handler, params, this.activeRoot ?? this.worktreeBase);
-      if (handler === "worktree_ensure" && result.status === "succeeded") {
-        const root = (result.result as { root?: unknown } | null)?.root;
-        if (typeof root === "string" && root) this.activeRoot = root;
+      // 方案 B：按 jamId 截获模型发出的真实 bash/read/write/edit 调用，供对应请求即时短路转交 DSH。
+      if (CAPTURED_HANDLERS.has(handler.toLowerCase())) {
+        const jamId = extractJamId(
+          stream.headers["x-capy-workspace"],
+          typeof record.invocationId === "string" ? record.invocationId : undefined,
+          typeof record.cwd === "string" ? record.cwd : undefined,
+        );
+        try { captureInvocation(handler, params, jamId); } catch { /* 捕获失败不影响拒绝 */ }
       }
+      result = this.machine.invoke(handler, params);
     } else {
       result = fail("MachineServer.Unavailable", `未实现的路径 ${stream.path}`);
     }

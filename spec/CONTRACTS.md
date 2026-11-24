@@ -254,23 +254,27 @@ Authorization: Bearer capyd_…
 }
 ```
 
-### 5.3 已实现 handler
+设备只解析 `handler` 与 `params`；未列入 §5.3 的 handler 不执行任何 payload。
+
+### 5.3 已实现 handler（仅控制面）
 
 | handler | params | result |
 |---|---|---|
-| `bash` | `{command, timeoutSeconds, ...}` | `{kind:"bash", stdout, stderr, exitCode, durationMs, timedOut, isError}` |
-| `bash_output` | `{operationId}` | `{kind:"not-running"}` |
-| `read` | `{path, offset?, limit?, maxChars?}` | `{kind:"read", content, offset, totalLines, isError:false}` |
-| `write` | `{path, content}` | `{kind:"write", path, bytes, isError:false}` |
-| `edit` | `{path, oldString, newString, replaceAll?}` | `{kind:"edit", path, replacements, isError:false}` |
-| `file_read` | `{path}` | `{kind:"read"|"missing", ...}` |
-| `file_write` | `{path, content, baseSha?}` | `{kind:"written"|"conflict", ...}` |
-| `worktree_ensure` | `{root, checkouts?, startFromOrigin?}` | `{root, created, checkouts: []}` |
-| `worktree_list` | `{roots?, activeRoots?, dirty?}` | `{kind:"worktree_list", entries: []}` |
-| `volume_landed` | `{mounts:[{mountPath,digest}]}` | `{kind:"volume_landed", mounts:[{mountPath,current:true}], landing:false, checkpoints:false, directories:[], unretained:[], handback:true}` |
-| `volume_probe` | `{mounts:[…]}` | `{mounts:[{mountPath,state:"current"}]}` |
-| `POST /v1/git/capture` | `{repos:[],baseRefs:["origin/HEAD"]}` | `{repos:[]}` |
-| 浏览器/computer 等 | — | `{status:"failed", error:{code:"MachineServer.Unavailable", message:"…"}}` |
+| `worktree_ensure` | `{root}`（`checkouts` / `startFromOrigin` 未使用） | `{root, created, checkouts: []}`；root 为空 → 空 root 成功；root 等于 `worktreeBase` 或其子目录（含 base 内的绝对路径）均可；父目录、`worktreeBase` 之外的绝对路径/不同盘符、路径组件含符号链接 → `MachineServer.Refused` |
+| `worktree_list` | 忽略 | `{kind:"worktree_list", entries: []}`（当前不列真实工作区） |
+| `volume_landed` | `{mounts:[{mountPath,digest}]}`（`digest` 未使用） | `{kind:"volume_landed", mounts:[{mountPath,current:true}], landing:false, checkpoints:false, directories:[], unretained:[], handback:true}`；除 `mountPath` 外均为常量 |
+| `volume_probe` | `{mounts:[…]}` | `{mounts:[{mountPath,state:"current"}]}`（常量占位，不做真实卷校验） |
+| `POST /v1/git/capture` | 任意（忽略） | `{repos:[]}`（空 capture） |
+| `bash`、`bash_output`、`read`、`write`、`edit`、`file_read`、`file_write`、浏览器/computer 及其他 handler | 按 `jamId` 截获 `bash/shell/run/exec/command/read/file_read/write/file_write/edit` 参数供客户端工具桥转交 | `{status:"succeeded", result:{kind:"failure", isError:true, message:"Tool execution is delegated to the client harness."}}` |
+| 其他路径 | — | `{status:"failed", error:{code:"MachineServer.Unavailable", message:"未实现的路径 …"}}` |
+
+**为什么拒绝要返回“成功 + `isError:true`”而不是传输失败**：Capy agent 把 handler 失败当作环境故障，容易重试同一工具；而带 `isError` 的工具结果文本它读得到，可以据此改用客户端契约。这只是诱导，不是强制——上游仍可能无视指令自行重试，见 §11 的边界说明。
+
+**仅控制面**：隧道 handler 没有 activeRoot、不 spawn 子进程、没有 `read` / `write` / `edit` / `file_*` 入口。handler 侧唯一由 machine RPC 触发的文件系统操作是 `worktree_ensure` 在 hello 宣告的 `worktreeBase` 下 `mkdir`，并做越界/符号链接校验；设备 token 的本地持久化属于控制面状态，不是 handler 能力。
+
+**本插件的 worktree 路由策略**（不是上游限制）：`worktree_ensure` 始终以 hello 宣告的 `worktreeBase` 为基目录（base 本身也合法），不把上一个 worktree 当基目录，没有活动工作目录，也不回退到父目录。
+
+**控制面声明不是安全边界**：它只说明隧道当前没有执行入口，不证明数据面其它路径（提示词、工具桥、附件下载）安全。
 
 ### 5.4 结果包装
 
@@ -286,6 +290,10 @@ Authorization: Bearer capyd_…
 { "status": "failed", "error": { "code": "MachineServer.Unavailable", "message": "…" } }
 ```
 
+失败码：`MachineServer.Unavailable`（未实现/已删除的执行 handler、未知路径）、
+`MachineServer.Refused`（worktree 越界或含符号链接）、`MachineServer.Timeout`（流超时）、
+`MachineServer.Internal`（处理异常）。设备响应 HTTP status 固定为 200，业务失败只看 `status` 字段。
+
 ## 6. Public API 原生 SSE
 
 ```http
@@ -300,6 +308,7 @@ Accept: text/event-stream
 |---|---|
 | `status` | `{threadId,status}` |
 | `assistant` | `{callId,text}`（增量或全文） |
+| `tool_call` | `{callId,name,text}`（摘要；本插件忽略，不转 OpenAI 调用） |
 | `transcript` | `{id,source,text,model?,callId?}` |
 | `turn` | `{phase:"start"|"end",outcome?}` |
 | `run` | `{phase:"start"|"end"}` |
@@ -310,10 +319,13 @@ Accept: text/event-stream
 规则：
 
 - `assistant` 按 `callId` 累积；若帧是全文（以已累积文本为前缀）只转发新增部分。
+- `tool_call` 只有 `callId/name/text` 摘要，不含参数或结果；不能转成 OpenAI `tool_calls`，
+  工具调用只来自 §9.4 的文本 JSON 包。
 - `transcript(source=assistant)` 是最终文本；用它校正。
-- `turn outcome=dropped` 丢弃 live 片段。
+- `turn outcome=dropped` 不改变事件流：已发出的 preview 不回撤，但 `committed=false`，
+  只能当普通文本，不能作为调用依据；最终文本仍以 transcript 校正。
 - `error.code=region_unsupported` → 403。
-- `run end` / `done` 完成；无 delta 才允许轮询 fallback。
+- `run end` / `done` 完成；无 delta 也不轮询 outline，改为 `jamFailure` 明确错误（轮询 fallback 未实现）。
 
 ## 7. Files（附件）
 
@@ -396,6 +408,54 @@ data: [DONE]
 { "error": { "message": "…", "type": "upstream_error", "code": "…", "status": 503 } }
 ```
 
+### 9.4 客户端工具（方案 B + 文本桥）
+
+请求可带 `tools` 与 `tool_choice`；工具名必须唯一，`tool_choice:"required"` 至少声明一个工具，
+指定工具必须是已声明的 function 名。工具名重复、无效 `tool_choice`、指定未声明工具 →
+400 `invalid_request`，在进入数据面前拒绝。规则：
+
+- 每个请求独立白名单：只接受该请求声明的 function 名，并严格校验 `tool_choice`；带工具请求不复用线程。
+- 文本桥解析优先级：
+  1. `<TOOL_CALL>{"name":"<declared>","arguments":{...}}</TOOL_CALL>`（支持多参数工具）。
+  2. 整段 JSON 包 `{"tool_calls":[{"name":"<declared>","arguments":{...}}]}`（允许外层代码围栏）。
+  3. `<CMD tool="...">...</CMD>` / `<CMD>...</CMD>`（跳过行内反引号示例与占位符，为含 `description` 的 shell 工具自动补全摘要）。
+- 方案 B（Machine RPC 拦截与即时短路）：当线程启用工具时，`ChatUseCase` 按 `jamId` 订阅 `bash/read/write/edit` 等隧道 RPC，剥离 `__capy_co_author` 初始化头与外层 shell 包装，按 schema 与 `tool_choice` 映射为多参数 OpenAI `tool_calls` 后立即短路 SSE 并 best-effort 中断上游 jam；`bridgeResponse` 兜底排空同一 `jamId` 缓冲。
+- 任一项文本包非法（未声明工具、多余字段、参数非对象、空数组）→ 整包拒绝，不做部分采纳。
+- 只有 Capy 已提交的 assistant transcript（`committed:true`）或方案 B 截获调用才允许产出 `tool_calls`；实时预览绝不转成 `tool_calls`。
+- `tool_choice:"auto"` 且既无文本调用也无合法 RPC 截获 → 按普通文本返回 `finish_reason:"stop"`。
+- `tool_choice:"required"` 或指定工具未满足 → 502 `upstream_error`。
+- `tool_choice:"none"` → 不注入工具说明、不解析调用包、不做方案 B 短路（普通文本）。
+- 调用 ID 由插件生成（`call_<ULID>`）；下一回合客户端以 `tool_call_id` 回传，插件把同一 ID
+  （仅去除首尾空白）、工具名和原始 `arguments` 写进纯文本 prompt 的 `<tool_call>` 块，并把客户端
+  `role:"tool"` 结果以同一 ID 绑定为 `<tool_result id=… name=…>`。ID 不是原生协议字段。
+  请求历史里缺 ID 的调用整条跳过，不补造。
+- 结果只能来自客户端 `role:"tool"` 消息；模型自带的“结果”会让包非法。
+
+非流式响应：
+
+```json
+{
+  "id": "chatcmpl-…",
+  "object": "chat.completion",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_…",
+        "type": "function",
+        "function": { "name": "…", "arguments": "{\"…\":…}" }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }],
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+}
+```
+
+流式：先发 `delta.role=assistant`，再发 `delta.tool_calls[]`，最后 `finish_reason:"tool_calls"` + `[DONE]`。
+
 ## 10. 错误映射
 
 | 上游 | 对外 |
@@ -410,6 +470,8 @@ data: [DONE]
 | 5xx / 网络 | 503 `upstream_unavailable` |
 | 超时 | 504 `upstream_timeout` |
 | 设备配对失败 | 403 `device_pair_failed` |
+| `tool_choice` required/指定工具未满足 | 502 `upstream_error` |
+| 工具桥关闭但请求 required/指定工具 | 400 `invalid_request` |
 
 ## 11. 测试约定
 
