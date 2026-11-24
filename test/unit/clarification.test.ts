@@ -34,6 +34,8 @@ test('blocking clarification in a real work request opens the question UI',async
   expect(r.choice.finish_reason).toBe('tool_calls');
   expect(r.outcome?.clarification).toBe('adapted');
   for(const plain of ['summarize','你好','Done.']) expect((await probe([user(plain)],stopping)).choice.finish_reason).toBe('stop');
+  const zh='我需要两样东西才能动手修：**harness 的代码位置**和**“打断”的具体表现**。这个工作区是空的（项目还没检出），我读不到源码和日志，只能猜。告诉我源码在哪个文件夹。';
+  expect((await probe([work],zh)).choice.finish_reason).toBe('tool_calls');
 });
 test('imperative English question, explicit named choice',async()=>{
   const r=await probe([user('Use ask_user_question to ask me for the code.')],'Tell me what the codename is.',{type:'function',function:{name}});

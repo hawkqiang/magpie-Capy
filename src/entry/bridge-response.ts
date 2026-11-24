@@ -108,14 +108,16 @@ function recoverQuestion(request:ChatRequest,text:string,tool:ToolDefinition): {
   if (request.messages.slice(idx+1).some(m=>m.role==='assistant' && m.toolCalls?.some(c=>c.name===name) || m.role==='tool' && m.name===name)) return {reason:'already_asked'};
   // Only copy an existing question. Do not interpret tool output as a request, invent
   // an answer or turn an approval challenge into a question-tool permission grant.
-  if (text.length>2048 || /```|<\/?(?:tool|cmd)|审批|批准|授权|权限|许可|确认执行|approval|approv|permission|authorize|password|密码|secret|密钥|token|credential/iu.test(text)) return {reason:'not_question'};
+  if (text.length>2048 || /```|<\/?(?:tool_result|tool_call|cmd_call)\b|审批|批准|授权|权限|许可|确认执行|approval|approv|permission|authorize|password|密码|secret|密钥|token|credential/iu.test(text)) return {reason:'not_question'};
   if (/(?:^|\n)\s*>|(?:says|example|示例|引用|输出)\s*[:：]/iu.test(text)) return {reason:'not_question'};
   // A work request only becomes a question when the reply is blocked: it says it cannot
   // proceed without the user, or asks for specific missing input. Ordinary answers that
   // merely contain a question mark must not be converted into a UI prompt.
-  const blocked=/can't|cannot|can not|unable to|won't be able|before i can|blocked|stuck|need (?:one|two|a few|more) (?:thing|things|piece|information|detail)|需要(?:你|您)(?:提供|告诉|确认|回答)|无法(?:继续|确定|判断|修复|定位)|才能(?:继续|修复|确定|判断)|缺少|不确定/iu.test(text);
+  const blocked=/can't|cannot|can not|unable to|won't be able|before i can|blocked|stuck|need (?:one|two|a few|more|specific) (?:thing|things|piece|information|detail)|告诉我|给我|提供|给我|我需要.{0,40}(?:东西|信息|资料|路径|目录)|需要(?:你|您)|请(?:你|您)?(?:给我|提供|告诉|给出)|无法(?:继续|确定|判断|修复|定位|动手)|才能(?:继续|修复|确定|判断|动手)|缺少|不确定/iu.test(text);
   if (!namedTool && !blocked) return {reason:'not_question'};
-  const clean=text.replace(/`[^`]*`/gu,'').replace(/（[^）]*）/gu,'').replace(/\s+/gu,' ').trim();
+  // Require an explicit request directed at the user, not just a rhetorical question.
+  if (!namedTool && !/(?:请|需要|给我|告诉我|提供|给出|tell me|provide|need (?:you|one|two|a few|specific)|which|what|can you|could you|source|folder|path|目录|路径|源码|信息|东西)/iu.test(text)) return {reason:'not_question'};
+  const clean=text.replace(/`[^`]*`/gu,'').replace(/（[^）]*）/gu,'').replace(/\*\*/gu,'').replace(/\s+/gu,' ').trim();
   const parts=clean.split(/(?<=[。！？.!?])\s*|\n+|[—–]+|\s+and\s+(?=now need\b)|[，,；;]\s*/iu).map(p=>p.trim()).filter(Boolean);
   const trigger=/请(?:你)?(?:先|直接)?(?:告诉我|告知|提供|输入)|需要你(?:先|直接)?(?:告诉我|告知|确认|提供)|(?:I\s+)?(?:now\s+)?need\s+(?:your|the)\b|(?:please\s+)?(?:tell me|provide|choose|which|what|could you tell me|can you provide)\b/iu;
   const precise=parts.flatMap(p => {
@@ -126,7 +128,7 @@ function recoverQuestion(request:ChatRequest,text:string,tool:ToolDefinition): {
   // ending the run. Only when it clearly asks the user, never a summary or approval.
   const asksUser=/请|需要你|我需要|告知|告诉|提供|确认|输入|选择|请问|哪|什么|是否|\?|？|\bneed\b|\btell me\b|\bprovide\b|\bwhich\b|\bwhat\b|\bcould you\b|\bcan you\b/iu.test(clean);
   const question = precise.length===1 ? precise[0]! : (precise.length===0 && asksUser ? clean : undefined);
-  if (!question || !question.trim() || /[<>`"“”]/u.test(question)) return {reason:'not_question'};
+  if (!question || !question.trim() || /[<>`]/u.test(question)) return {reason:'not_question'};
   const args={questions:[{id:'clarify',question}]};
   if (!fits(args,tool.function.parameters)) return {reason:'unsupported_schema'};
   return {reason:'adapted',call:{name,arguments:JSON.stringify(args)}};

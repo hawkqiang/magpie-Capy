@@ -1001,14 +1001,16 @@ function recoverQuestion(request, text, tool) {
     return { reason: "no_intent" };
   if (request.messages.slice(idx + 1).some((m) => m.role === "assistant" && m.toolCalls?.some((c) => c.name === name) || m.role === "tool" && m.name === name))
     return { reason: "already_asked" };
-  if (text.length > 2048 || /```|<\/?(?:tool|cmd)|\u5BA1\u6279|\u6279\u51C6|\u6388\u6743|\u6743\u9650|\u8BB8\u53EF|\u786E\u8BA4\u6267\u884C|approval|approv|permission|authorize|password|\u5BC6\u7801|secret|\u5BC6\u94A5|token|credential/iu.test(text))
+  if (text.length > 2048 || /```|<\/?(?:tool_result|tool_call|cmd_call)\b|\u5BA1\u6279|\u6279\u51C6|\u6388\u6743|\u6743\u9650|\u8BB8\u53EF|\u786E\u8BA4\u6267\u884C|approval|approv|permission|authorize|password|\u5BC6\u7801|secret|\u5BC6\u94A5|token|credential/iu.test(text))
     return { reason: "not_question" };
   if (/(?:^|\n)\s*>|(?:says|example|\u793A\u4F8B|\u5F15\u7528|\u8F93\u51FA)\s*[:\uFF1A]/iu.test(text))
     return { reason: "not_question" };
-  const blocked = /can't|cannot|can not|unable to|won't be able|before i can|blocked|stuck|need (?:one|two|a few|more) (?:thing|things|piece|information|detail)|\u9700\u8981(?:\u4F60|\u60A8)(?:\u63D0\u4F9B|\u544A\u8BC9|\u786E\u8BA4|\u56DE\u7B54)|\u65E0\u6CD5(?:\u7EE7\u7EED|\u786E\u5B9A|\u5224\u65AD|\u4FEE\u590D|\u5B9A\u4F4D)|\u624D\u80FD(?:\u7EE7\u7EED|\u4FEE\u590D|\u786E\u5B9A|\u5224\u65AD)|\u7F3A\u5C11|\u4E0D\u786E\u5B9A/iu.test(text);
+  const blocked = /can't|cannot|can not|unable to|won't be able|before i can|blocked|stuck|need (?:one|two|a few|more|specific) (?:thing|things|piece|information|detail)|\u544A\u8BC9\u6211|\u7ED9\u6211|\u63D0\u4F9B|\u7ED9\u6211|\u6211\u9700\u8981.{0,40}(?:\u4E1C\u897F|\u4FE1\u606F|\u8D44\u6599|\u8DEF\u5F84|\u76EE\u5F55)|\u9700\u8981(?:\u4F60|\u60A8)|\u8BF7(?:\u4F60|\u60A8)?(?:\u7ED9\u6211|\u63D0\u4F9B|\u544A\u8BC9|\u7ED9\u51FA)|\u65E0\u6CD5(?:\u7EE7\u7EED|\u786E\u5B9A|\u5224\u65AD|\u4FEE\u590D|\u5B9A\u4F4D|\u52A8\u624B)|\u624D\u80FD(?:\u7EE7\u7EED|\u4FEE\u590D|\u786E\u5B9A|\u5224\u65AD|\u52A8\u624B)|\u7F3A\u5C11|\u4E0D\u786E\u5B9A/iu.test(text);
   if (!namedTool && !blocked)
     return { reason: "not_question" };
-  const clean = text.replace(/`[^`]*`/gu, "").replace(/\uFF08[^\uFF09]*\uFF09/gu, "").replace(/\s+/gu, " ").trim();
+  if (!namedTool && !/(?:\u8BF7|\u9700\u8981|\u7ED9\u6211|\u544A\u8BC9\u6211|\u63D0\u4F9B|\u7ED9\u51FA|tell me|provide|need (?:you|one|two|a few|specific)|which|what|can you|could you|source|folder|path|\u76EE\u5F55|\u8DEF\u5F84|\u6E90\u7801|\u4FE1\u606F|\u4E1C\u897F)/iu.test(text))
+    return { reason: "not_question" };
+  const clean = text.replace(/`[^`]*`/gu, "").replace(/\uFF08[^\uFF09]*\uFF09/gu, "").replace(/\*\*/gu, "").replace(/\s+/gu, " ").trim();
   const parts = clean.split(/(?<=[\u3002\uFF01\uFF1F.!?])\s*|\n+|[\u2014\u2013]+|\s+and\s+(?=now need\b)|[\uFF0C,\uFF1B;]\s*/iu).map((p) => p.trim()).filter(Boolean);
   const trigger = /\u8BF7(?:\u4F60)?(?:\u5148|\u76F4\u63A5)?(?:\u544A\u8BC9\u6211|\u544A\u77E5|\u63D0\u4F9B|\u8F93\u5165)|\u9700\u8981\u4F60(?:\u5148|\u76F4\u63A5)?(?:\u544A\u8BC9\u6211|\u544A\u77E5|\u786E\u8BA4|\u63D0\u4F9B)|(?:I\s+)?(?:now\s+)?need\s+(?:your|the)\b|(?:please\s+)?(?:tell me|provide|choose|which|what|could you tell me|can you provide)\b/iu;
   const precise = parts.flatMap((p) => {
@@ -1017,7 +1019,7 @@ function recoverQuestion(request, text, tool) {
   });
   const asksUser = /\u8BF7|\u9700\u8981\u4F60|\u6211\u9700\u8981|\u544A\u77E5|\u544A\u8BC9|\u63D0\u4F9B|\u786E\u8BA4|\u8F93\u5165|\u9009\u62E9|\u8BF7\u95EE|\u54EA|\u4EC0\u4E48|\u662F\u5426|\?|\uFF1F|\bneed\b|\btell me\b|\bprovide\b|\bwhich\b|\bwhat\b|\bcould you\b|\bcan you\b/iu.test(clean);
   const question = precise.length === 1 ? precise[0] : precise.length === 0 && asksUser ? clean : undefined;
-  if (!question || !question.trim() || /[<>`"\u201C\u201D]/u.test(question))
+  if (!question || !question.trim() || /[<>`]/u.test(question))
     return { reason: "not_question" };
   const args = { questions: [{ id: "clarify", question }] };
   if (!fits(args, tool.function.parameters))
