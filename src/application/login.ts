@@ -32,7 +32,7 @@ export class LoginUseCase {
     const me = await this.options.app.me(jwt, signal);
     const orgs = await this.options.app.organizations(jwt, signal);
     const ids = orgs.map((org) => org.id);
-    const wanted = String(credential.orgId ?? "").trim();
+    const wanted = cleanOrg(credential.orgId);
     if (wanted && !ids.includes(wanted)) {
       throw new CapyError("invalid_request", `登录凭据指定的组织 ${wanted} 不在账号组织列表里`);
     }
@@ -68,11 +68,17 @@ export class LoginUseCase {
   }
 }
 
+/** Some Capy builds store an absent org as the literal string "null"/"undefined". */
+function cleanOrg(value: unknown): string {
+  const v = String(value ?? "").trim();
+  return v === "null" || v === "undefined" ? "" : v;
+}
+
 function pickOrg(orgs: readonly Organization[], fromCredential?: string, preferred?: string): string {
   const ids = orgs.map((org) => org.id);
-  const wanted = String(fromCredential ?? "").trim();
+  const wanted = cleanOrg(fromCredential);
   if (wanted && ids.includes(wanted)) return wanted;
-  const pref = String(preferred ?? "").trim();
+  const pref = cleanOrg(preferred);
   if (pref && ids.includes(pref)) return pref;
   // 只有一个组织时没有歧义；多组织且没有明确偏好则不猜。
   if (ids.length === 1) return ids[0] ?? "";

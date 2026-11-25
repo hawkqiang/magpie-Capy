@@ -2333,9 +2333,11 @@ var CLERK_STATE = `(() => {
 })()`;
 var SELECTED_ORG = `(() => {
   try {
-    return localStorage.getItem("capy-web:selected-org")
+    const raw = localStorage.getItem("capy-web:selected-org")
       || localStorage.getItem("capy-web:last-selected-org")
       || "";
+    // Newer Capy persists an absent selection as the literal string "null".
+    return raw === "null" || raw === "undefined" ? "" : raw;
   } catch { return ""; }
 })()`;
 async function readCookie(cdp) {
@@ -4786,7 +4788,7 @@ class LoginUseCase {
     const me = await this.options.app.me(jwt, signal);
     const orgs = await this.options.app.organizations(jwt, signal);
     const ids = orgs.map((org) => org.id);
-    const wanted = String(credential.orgId ?? "").trim();
+    const wanted = cleanOrg(credential.orgId);
     if (wanted && !ids.includes(wanted)) {
       throw new CapyError("invalid_request", `\u767B\u5F55\u51ED\u636E\u6307\u5B9A\u7684\u7EC4\u7EC7 ${wanted} \u4E0D\u5728\u8D26\u53F7\u7EC4\u7EC7\u5217\u8868\u91CC`);
     }
@@ -4810,12 +4812,16 @@ class LoginUseCase {
     };
   }
 }
+function cleanOrg(value) {
+  const v = String(value ?? "").trim();
+  return v === "null" || v === "undefined" ? "" : v;
+}
 function pickOrg(orgs, fromCredential, preferred) {
   const ids = orgs.map((org) => org.id);
-  const wanted = String(fromCredential ?? "").trim();
+  const wanted = cleanOrg(fromCredential);
   if (wanted && ids.includes(wanted))
     return wanted;
-  const pref = String(preferred ?? "").trim();
+  const pref = cleanOrg(preferred);
   if (pref && ids.includes(pref))
     return pref;
   if (ids.length === 1)

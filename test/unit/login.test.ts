@@ -76,6 +76,18 @@ test("login：credential 指定 org 优先", async () => {
   expect(session.clientId).toBe("");
 });
 
+test("login：credential orgId 为字符串 null/undefined 时按未指定处理", async () => {
+  for (const bogus of ["null", "undefined"]) {
+    const app = fakeApp();
+    const useCase = new LoginUseCase({
+      app,
+      sources: fakeSources({ clientJwt: "c", sessionId: "s", userId: "u", orgId: bogus, source: "browser" }),
+    });
+    const session = await useCase.login("browser");
+    expect(session.orgId).toBe("org_2"); // me.preferredOrgId wins
+  }
+});
+
 test("login：没有组织 → invalid_request", async () => {
   const app = fakeApp({
     async me() { return { id: "user_1" }; },

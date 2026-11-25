@@ -214,9 +214,11 @@ const CLERK_STATE = `(() => {
 
 const SELECTED_ORG = `(() => {
   try {
-    return localStorage.getItem("capy-web:selected-org")
+    const raw = localStorage.getItem("capy-web:selected-org")
       || localStorage.getItem("capy-web:last-selected-org")
       || "";
+    // Newer Capy persists an absent selection as the literal string "null".
+    return raw === "null" || raw === "undefined" ? "" : raw;
   } catch { return ""; }
 })()`;
 
