@@ -261,6 +261,9 @@ function launchArgs(port: number, profile: string): string[] {
     "--no-default-browser-check",
     "--disable-extensions",
     "--disable-background-networking",
+    // Chrome exposes navigator.webdriver=true whenever remote debugging is on.
+    // Google sign-in reads that flag and refuses the login as "insecure browser".
+    "--disable-blink-features=AutomationControlled",
     LOGIN_URL,
   ];
 }

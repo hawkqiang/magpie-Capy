@@ -2382,6 +2382,7 @@ function launchArgs(port, profile) {
     "--no-default-browser-check",
     "--disable-extensions",
     "--disable-background-networking",
+    "--disable-blink-features=AutomationControlled",
     LOGIN_URL
   ];
 }
