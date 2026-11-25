@@ -919,7 +919,7 @@ function mapInvocationToToolCall(inv, tools, toolChoice) {
 }
 
 // src/entry/bridge-response.ts
-async function bridgeResponse(request, events, meta, bridge, nextId, onOutcome, getJamId) {
+async function bridgeResponse(request, events, meta, bridge, nextId, onOutcome, getJamId, reflectCompletion) {
   const reply = await collectReply(events);
   const tools = request.tools ?? [];
   const parsed = reply.committed ? bridge.parse(reply.text, tools, request.toolChoice) : null;
@@ -927,17 +927,23 @@ async function bridgeResponse(request, events, meta, bridge, nextId, onOutcome, 
   const fromCapture = !parsed && reply.committed ? reply.capturedCalls && reply.capturedCalls.length > 0 ? [...reply.capturedCalls] : fromBuffer : null;
   let calls = parsed?.calls ?? fromCapture;
   const questionTool = tools.find((t) => t.function.name === "ask_user_question");
+  const alreadyAsked = request.messages.some((m) => m.role === "assistant" && m.toolCalls?.some((c) => c.name === "ask_user_question") || m.role === "tool" && m.name === "ask_user_question");
   let clarification;
   if (questionTool) {
     if (calls?.length)
       clarification = "existing_call";
     else if (!reply.committed)
       clarification = "uncommitted";
-    else {
-      const result = recoverQuestion(request, reply.text, questionTool);
-      clarification = result.reason;
-      if (result.call)
-        calls = [result.call];
+    else if (alreadyAsked)
+      clarification = "existing_call";
+    else if (reflectCompletion) {
+      const reflected = await reflectCompletion(request, reply.text).catch(() => null);
+      if (reflected) {
+        calls = [reflected];
+        clarification = "reflected_ask";
+      } else {
+        clarification = "reflected_done";
+      }
     }
   }
   onOutcome?.({ committed: reply.committed, internalTools: reply.internalTools, calls: calls?.length ?? 0, ...clarification ? { clarification } : {} });
@@ -949,82 +955,6 @@ async function bridgeResponse(request, events, meta, bridge, nextId, onOutcome, 
     throw new CapyError("upstream_error", reply.committed ? reply.internalTools ? "\u4E0A\u6E38 agent \u7528\u4E86\u81EA\u5DF1\u7684\u5185\u90E8\u5DE5\u5177\uFF0C\u6CA1\u6709\u8FD4\u56DE\u53EF\u8F6C\u4EA4\u7684 <CMD> \u6216 Machine RPC \u547D\u4EE4" : "\u6A21\u578B\u672A\u8FD4\u56DE\u6EE1\u8DB3 tool_choice \u7684 <CMD> \u8C03\u7528" : "\u4E0A\u6E38\u6CA1\u6709\u63D0\u4EA4\u5B8C\u6574\u56DE\u590D\uFF0C\u4E0D\u80FD\u4ECE\u4E2D\u63D0\u53D6\u8C03\u7528");
   }
   return request.stream ? encodeChatStream(textEvents(reply.text), meta) : encodeCompletion(meta.id, meta.model, meta.created, reply.text);
-}
-function fits(value, node) {
-  if (!node || typeof node !== "object" || Array.isArray(node))
-    return false;
-  const s = node;
-  const common = ["type", "description", "title", "default", "$schema"];
-  const extras = s.type === "object" ? ["properties", "required", "additionalProperties"] : s.type === "array" ? ["items", "minItems", "maxItems"] : ["minLength", "maxLength"];
-  if (Object.keys(s).some((k) => ![...common, ...extras].includes(k)))
-    return false;
-  if (s.type === "object" && value && typeof value === "object" && !Array.isArray(value)) {
-    if (s.additionalProperties !== undefined && typeof s.additionalProperties !== "boolean")
-      return false;
-    if (s.required !== undefined && (!Array.isArray(s.required) || !s.required.every((k) => typeof k === "string" && Object.hasOwn(value, k))))
-      return false;
-    const props = s.properties;
-    return !!props && Object.entries(value).every(([k, v]) => Object.hasOwn(props, k) && fits(v, props[k]));
-  }
-  if (s.type === "array" && Array.isArray(value))
-    return bounds(value.length, s.minItems, s.maxItems) && value.every((v) => fits(v, s.items));
-  return s.type === "string" && typeof value === "string" && bounds([...value].length, s.minLength, s.maxLength);
-}
-function bounds(n, min, max) {
-  return (min === undefined || typeof min === "number" && n >= min) && (max === undefined || typeof max === "number" && n <= max);
-}
-function recoverQuestion(request, text, tool) {
-  const choice = request.toolChoice, name = "ask_user_question";
-  const named = choice?.function?.name;
-  if (choice != null && choice !== "auto" && choice !== "required" && named !== name)
-    return { reason: "choice_excluded" };
-  let idx = -1, intent = "";
-  for (let i = request.messages.length - 1;i >= 0; i--) {
-    const msg = request.messages[i];
-    if (msg?.role !== "user")
-      continue;
-    const c = msg.content;
-    const raw = (typeof c === "string" ? c : c?.flatMap((p) => ("text" in p) ? [p.text] : []).join(`
-`))?.trim() ?? "";
-    if (/^<system-reminder>[\s\S]*?<\/system-reminder>$/u.test(raw) || /^Time sampled while preparing turn \d+, step \d+:/u.test(raw))
-      continue;
-    idx = i;
-    intent = raw;
-    break;
-  }
-  const intentClean = intent.replace(/\u4E0D\u8981\u731C|do not guess|don't guess/giu, "");
-  if (idx < 0 || /(?:\u4E0D\u8981|\u522B|\u4E0D\u518D|\u65E0\u9700|\u8DF3\u8FC7|\u62D2\u7EDD|skip|declin|don't|do not|never|instead of|example|quote|\u793A\u4F8B|\u5F15\u7528|```|^>)/imu.test(intentClean))
-    return { reason: "no_intent" };
-  const namedTool = /(?:^|[\uFF0C\u3002\uFF1B\uFF1A,;:\n]|\bthen\s+)(?:\s*(?:\u7136\u540E|\u8BF7|\u5FC5\u987B|\u518D|please\s+|must\s+|then\s+))*(?:\u8C03\u7528|\u4F7F\u7528|call\s+|use\s+)\s*`?ask_user_question\b/iu.test(intentClean);
-  const workRequest = /(?:\u4FEE\u590D|\u6392\u67E5|\u5B9A\u4F4D|\u68C0\u67E5|\u770B\u4E0B|\u770B\u4E00\u4E0B|\u67E5\u4E00\u4E0B|\u89E3\u51B3|\u5904\u7406|\u80FD\u5426|\u80FD\u4E0D\u80FD|\u53EF\u4EE5.{0,4}(?:\u4FEE|\u67E5|\u770B)|fix|debug|investigate|look\s+into|diagnose|can\s+you\s+(?:fix|check|look))/iu.test(intentClean);
-  if (!namedTool && !workRequest)
-    return { reason: "no_intent" };
-  if (request.messages.slice(idx + 1).some((m) => m.role === "assistant" && m.toolCalls?.some((c) => c.name === name) || m.role === "tool" && m.name === name))
-    return { reason: "already_asked" };
-  if (text.length > 2048 || /```|<\/?(?:tool_result|tool_call|cmd_call)\b|\u5BA1\u6279|\u6279\u51C6|\u6388\u6743|\u6743\u9650|\u8BB8\u53EF|\u786E\u8BA4\u6267\u884C|approval|approv|permission|authorize|password|\u5BC6\u7801|secret|\u5BC6\u94A5|token|credential/iu.test(text))
-    return { reason: "not_question" };
-  if (/(?:^|\n)\s*>|(?:says|example|\u793A\u4F8B|\u5F15\u7528|\u8F93\u51FA)\s*[:\uFF1A]/iu.test(text))
-    return { reason: "not_question" };
-  const blocked = /can't|cannot|can not|unable to|won't be able|before i can|blocked|stuck|need (?:one|two|a few|more|specific) (?:thing|things|piece|information|detail)|\u544A\u8BC9\u6211|\u7ED9\u6211|\u63D0\u4F9B|\u7ED9\u6211|\u6211\u9700\u8981.{0,40}(?:\u4E1C\u897F|\u4FE1\u606F|\u8D44\u6599|\u8DEF\u5F84|\u76EE\u5F55)|\u9700\u8981(?:\u4F60|\u60A8)|\u8BF7(?:\u4F60|\u60A8)?(?:\u7ED9\u6211|\u63D0\u4F9B|\u544A\u8BC9|\u7ED9\u51FA)|\u65E0\u6CD5(?:\u7EE7\u7EED|\u786E\u5B9A|\u5224\u65AD|\u4FEE\u590D|\u5B9A\u4F4D|\u52A8\u624B)|\u624D\u80FD(?:\u7EE7\u7EED|\u4FEE\u590D|\u786E\u5B9A|\u5224\u65AD|\u52A8\u624B)|\u7F3A\u5C11|\u4E0D\u786E\u5B9A/iu.test(text);
-  if (!namedTool && !blocked)
-    return { reason: "not_question" };
-  if (!namedTool && !/(?:\u8BF7|\u9700\u8981|\u7ED9\u6211|\u544A\u8BC9\u6211|\u63D0\u4F9B|\u7ED9\u51FA|tell me|provide|need (?:you|one|two|a few|specific)|which|what|can you|could you|source|folder|path|\u76EE\u5F55|\u8DEF\u5F84|\u6E90\u7801|\u4FE1\u606F|\u4E1C\u897F)/iu.test(text))
-    return { reason: "not_question" };
-  const clean = text.replace(/`[^`]*`/gu, "").replace(/\uFF08[^\uFF09]*\uFF09/gu, "").replace(/\*\*/gu, "").replace(/\s+/gu, " ").trim();
-  const parts = clean.split(/(?<=[\u3002\uFF01\uFF1F.!?])\s*|\n+|[\u2014\u2013]+|\s+and\s+(?=now need\b)|[\uFF0C,\uFF1B;]\s*/iu).map((p) => p.trim()).filter(Boolean);
-  const trigger = /\u8BF7(?:\u4F60)?(?:\u5148|\u76F4\u63A5)?(?:\u544A\u8BC9\u6211|\u544A\u77E5|\u63D0\u4F9B|\u8F93\u5165)|\u9700\u8981\u4F60(?:\u5148|\u76F4\u63A5)?(?:\u544A\u8BC9\u6211|\u544A\u77E5|\u786E\u8BA4|\u63D0\u4F9B)|(?:I\s+)?(?:now\s+)?need\s+(?:your|the)\b|(?:please\s+)?(?:tell me|provide|choose|which|what|could you tell me|can you provide)\b/iu;
-  const precise = parts.flatMap((p) => {
-    const at = p.match(trigger)?.index;
-    return at !== undefined ? [p.slice(at)] : /[\uFF1F?]$/u.test(p) ? [p] : [];
-  });
-  const asksUser = /\u8BF7|\u9700\u8981\u4F60|\u6211\u9700\u8981|\u544A\u77E5|\u544A\u8BC9|\u63D0\u4F9B|\u786E\u8BA4|\u8F93\u5165|\u9009\u62E9|\u8BF7\u95EE|\u54EA|\u4EC0\u4E48|\u662F\u5426|\?|\uFF1F|\bneed\b|\btell me\b|\bprovide\b|\bwhich\b|\bwhat\b|\bcould you\b|\bcan you\b/iu.test(clean);
-  const question = precise.length === 1 ? precise[0] : precise.length === 0 && asksUser ? clean : undefined;
-  if (!question || !question.trim() || /[<>`]/u.test(question))
-    return { reason: "not_question" };
-  const args = { questions: [{ id: "clarify", question }] };
-  if (!fits(args, tool.function.parameters))
-    return { reason: "unsupported_schema" };
-  return { reason: "adapted", call: { name, arguments: JSON.stringify(args) } };
 }
 function capturedCalls(tools, toolChoice, jamId) {
   const drained = drainInvocations(jamId || undefined);
@@ -5125,6 +5055,82 @@ function isoOf(value) {
   return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
+// src/application/reflection.ts
+var REFLECT_ASK = "ask_user_question";
+var REFLECT_DONE = "report_done";
+function reflectionTools() {
+  return [
+    {
+      type: "function",
+      function: {
+        name: REFLECT_ASK,
+        description: "Ask the user a concise question for the specific information still needed to finish.",
+        parameters: {
+          type: "object",
+          properties: {
+            questions: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { id: { type: "string" }, question: { type: "string" } },
+                required: ["id", "question"]
+              }
+            }
+          },
+          required: ["questions"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: REFLECT_DONE,
+        description: "Report that the task is genuinely complete, with a one-sentence core reason.",
+        parameters: {
+          type: "object",
+          properties: { reason: { type: "string" } },
+          required: ["reason"]
+        }
+      }
+    }
+  ];
+}
+function humanIntent(messages) {
+  for (let i = messages.length - 1;i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== "user")
+      continue;
+    const raw = typeof m.content === "string" ? m.content : m.content.map((p) => ("text" in p) ? p.text : "").join(`
+`);
+    const t = raw.trim();
+    if (!t || t.startsWith("<system-reminder>") || t.startsWith("Time sampled"))
+      continue;
+    return t.slice(0, 4000);
+  }
+  return "";
+}
+function reflectionPrompt(request, replyText) {
+  return [
+    "You are a completion reviewer for a single coding-agent turn.",
+    "",
+    "The user's request was:",
+    "<request>",
+    humanIntent(request.messages) || "(not available)",
+    "</request>",
+    "",
+    "The assistant's final reply was:",
+    "<reply>",
+    replyText.slice(0, 6000),
+    "</reply>",
+    "",
+    "Decide whether the assistant has truly completed the user's request.",
+    "- If it still needs information from the user to proceed, call ask_user_question with a concise question asking for exactly that missing information.",
+    "- If the request is genuinely complete, call report_done with a one-sentence core reason.",
+    "Call exactly one of these tools. Do not output plain text."
+  ].join(`
+`);
+}
+
 // src/entry/plugin.ts
 var DEFAULT_PROVIDER_ID = "capy";
 var SDK2 = "@ai-sdk/openai-compatible";
@@ -5373,7 +5379,34 @@ async function CapyPlugin(_ctx = {}, options = {}) {
                   if (process.env.MAGPIE_CAPY_TOOL_DIAGNOSTICS === "1") {
                     logger.event("provider.tools.outcome", { ...outcome });
                   }
-                }, () => activeThreadId);
+                }, () => activeThreadId, async (req, replyText) => {
+                  const reflectEvents = chat.stream(session, {
+                    model: req.model,
+                    stream: false,
+                    tools: reflectionTools(),
+                    toolChoice: "required",
+                    messages: [{ role: "user", content: reflectionPrompt(req, replyText) }]
+                  }, { ...signal ? { signal } : {}, onThread: (thread) => {
+                    activeThreadId = thread.id;
+                  } });
+                  const reflected = await collectReply(reflectEvents);
+                  if (!reflected.committed)
+                    return null;
+                  const parsed = new PromptToolBridge().parse(reflected.text, reflectionTools(), "required");
+                  const call = parsed?.calls?.[0];
+                  if (!call)
+                    return null;
+                  if (call.name === REFLECT_ASK) {
+                    const args = JSON.parse(call.arguments);
+                    const questions = Array.isArray(args?.questions) ? args.questions : [];
+                    if (!questions.length || !questions.every((q) => q && typeof q.id === "string" && typeof q.question === "string" && q.question.trim()))
+                      return null;
+                    return { name: REFLECT_ASK, arguments: call.arguments };
+                  }
+                  if (call.name === REFLECT_DONE)
+                    return null;
+                  return null;
+                });
               }
               if (requestBody.stream)
                 return encodeChatStream(events, meta);

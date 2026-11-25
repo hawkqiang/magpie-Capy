@@ -33,8 +33,10 @@ import {
   encodeErrorResponse,
   encodeModelList,
   collectText,
+  collectReply,
   parseChatRequest,
 } from "../protocol/openai.ts";
+import { reflectionPrompt, reflectionTools, REFLECT_ASK, REFLECT_DONE } from "../application/reflection.ts";
 
 const DEFAULT_PROVIDER_ID = "capy";
 const SDK = "@ai-sdk/openai-compatible";
@@ -332,6 +334,30 @@ export default async function CapyPlugin(
                     }
                   },
                   () => activeThreadId,
+                  async (req: import("../domain/chat.ts").ChatRequest, replyText: string) => {
+                    // 完成反思：跟随当前模型的强制二选一请求；不复用工具回合线程。
+                    const reflectEvents = chat.stream(session, {
+                      model: req.model,
+                      stream: false,
+                      tools: reflectionTools(),
+                      toolChoice: "required",
+                      messages: [{ role: "user", content: reflectionPrompt(req, replyText) }],
+                    }, { ...(signal ? { signal } : {}), onThread: thread => { activeThreadId = thread.id; } });
+                    const reflected = await collectReply(reflectEvents);
+                    if (!reflected.committed) return null;
+                    const parsed = new PromptToolBridge().parse(reflected.text, reflectionTools(), "required");
+                    const call = parsed?.calls?.[0];
+                    if (!call) return null;
+                    if (call.name === REFLECT_ASK) {
+                      const args = JSON.parse(call.arguments);
+                      const questions = Array.isArray(args?.questions) ? args.questions : [];
+                      if (!questions.length || !questions.every((q: { id?: unknown; question?: unknown }) =>
+                        q && typeof q.id === "string" && typeof q.question === "string" && q.question.trim())) return null;
+                      return { name: REFLECT_ASK, arguments: call.arguments };
+                    }
+                    if (call.name === REFLECT_DONE) return null;
+                    return null;
+                  },
                 );
               }
               if (requestBody.stream) return encodeChatStream(events, meta);
