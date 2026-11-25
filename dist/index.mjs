@@ -2271,7 +2271,16 @@ async function connectPage(port, signal, timeoutMs) {
       if (page && typeof page.webSocketDebuggerUrl === "string") {
         const ws = new WebSocket(page.webSocketDebuggerUrl);
         await waitOpen(ws, signal);
-        return new CdpConnection(ws);
+        const conn = new CdpConnection(ws);
+        try {
+          await conn.send("Page.addScriptToEvaluateOnNewDocument", {
+            source: 'Object.defineProperty(navigator, "webdriver", { get: () => undefined, configurable: true });'
+          });
+          await conn.send("Runtime.evaluate", {
+            expression: 'Object.defineProperty(navigator, "webdriver", { get: () => undefined, configurable: true });'
+          });
+        } catch {}
+        return conn;
       }
     }
     await sleep(200, signal);
@@ -2382,9 +2391,6 @@ function launchArgs(port, profile) {
     `--user-data-dir=${profile}`,
     "--no-first-run",
     "--no-default-browser-check",
-    "--disable-extensions",
-    "--disable-background-networking",
-    "--disable-blink-features=AutomationControlled",
     LOGIN_URL
   ];
 }

@@ -155,7 +155,17 @@ async function connectPage(port: number, signal: AbortSignal, timeoutMs: number)
       if (page && typeof page.webSocketDebuggerUrl === "string") {
         const ws = new WebSocket(page.webSocketDebuggerUrl);
         await waitOpen(ws, signal);
-        return new CdpConnection(ws);
+        const conn = new CdpConnection(ws);
+        // 通过 CDP 注入脚本抹平自动化标志，避免添加不受支持的命令行标志或被 Google 判定为受控环境
+        try {
+          await conn.send("Page.addScriptToEvaluateOnNewDocument", {
+            source: 'Object.defineProperty(navigator, "webdriver", { get: () => undefined, configurable: true });',
+          });
+          await conn.send("Runtime.evaluate", {
+            expression: 'Object.defineProperty(navigator, "webdriver", { get: () => undefined, configurable: true });',
+          });
+        } catch {}
+        return conn;
       }
     }
     await sleep(200, signal);
@@ -261,11 +271,6 @@ function launchArgs(port: number, profile: string): string[] {
     `--user-data-dir=${profile}`,
     "--no-first-run",
     "--no-default-browser-check",
-    "--disable-extensions",
-    "--disable-background-networking",
-    // Chrome exposes navigator.webdriver=true whenever remote debugging is on.
-    // Google sign-in reads that flag and refuses the login as "insecure browser".
-    "--disable-blink-features=AutomationControlled",
     LOGIN_URL,
   ];
 }
